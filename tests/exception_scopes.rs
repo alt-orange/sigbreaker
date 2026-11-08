@@ -118,7 +118,7 @@ fn unrecognized_handler_identity_is_pinned_and_malformed_scopes_are_rejected() {
 }
 
 #[test]
-fn guarded_continuations_and_mid_instruction_scope_boundaries_stay_pinned() {
+fn guard_flag_without_a_table_allows_movement_and_bad_scope_boundaries_stay_pinned() {
     for guarded in [false, true] {
         let mut d = fixture();
         if guarded {
@@ -137,10 +137,66 @@ fn guarded_continuations_and_mid_instruction_scope_boundaries_stay_pinned() {
             relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42))
                 .unwrap()
                 .applied,
-            0
+            u64::from(guarded)
         );
-        assert_eq!(pe.data, d);
+        if !guarded {
+            assert_eq!(pe.data, d);
+        }
     }
+}
+
+#[test]
+fn guarded_continuation_table_is_rewritten_and_sorted_with_scope_targets() {
+    let mut d = fixture();
+    put(&mut d, 0x118, 0x3000);
+    put(&mut d, 0x11C, 280);
+    d[0xC00..0xD18].fill(0);
+    put(&mut d, 0xC00, 280);
+    put(&mut d, 0xC90, 0x00400000);
+    d[0xD08..0xD10].copy_from_slice(&0x140003180u64.to_le_bytes());
+    d[0xD10..0xD18].copy_from_slice(&2u64.to_le_bytes());
+    put(&mut d, 0xD80, 0x1004);
+    put(&mut d, 0xD84, 0x100A);
+    let mut pe = PeFile::parse(d.clone()).unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    let counters = relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+    assert_eq!(counters.applied, 1);
+    assert_eq!(pe.layout().eh_continuations.len(), 2);
+    let f = pe.layout().runtime_functions.last().unwrap();
+    assert!(pe.layout().eh_continuations.iter().all(|r| f.contains(r)));
+    let scope = &pe.layout().c_specific[&f.start];
+    assert!(pe
+        .layout()
+        .eh_continuations
+        .contains(&scope.scopes[0].target));
+    // An append layout retains the old body and needs both sets of targets.
+    let symbols = std::collections::BTreeMap::from([(0x11C0, "__C_specific_handler".to_owned())]);
+    let mut appended = PeFile::parse_with_symbols(d.clone(), symbols).unwrap();
+    let a = Analysis::run(appended.layout(), &appended.data).unwrap();
+    relayout::run(&a, &mut appended, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+    assert_eq!(appended.layout().eh_continuations.len(), 4);
+    assert!(appended.layout().eh_continuations.contains(&0x1004));
+    assert!(appended.layout().eh_continuations.contains(&0x100A));
+    assert!(appended
+        .layout()
+        .eh_continuations
+        .iter()
+        .any(|r| *r >= 0x4000));
+    for values in [[0x100A, 0x1004], [0x1004, 0x1004], [0x1004, 0x4000]] {
+        let mut invalid = d.clone();
+        put(&mut invalid, 0xD80, values[0]);
+        put(&mut invalid, 0xD84, values[1]);
+        assert!(PeFile::parse(invalid).is_err());
+    }
+    put(&mut d, 0xD80, 0x1001);
+    let mut pe = PeFile::parse(d).unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    assert_eq!(
+        relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42))
+            .unwrap()
+            .applied,
+        0
+    );
 }
 
 #[test]

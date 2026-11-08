@@ -23,6 +23,112 @@ fn metadata_fixture(code: &[u8]) -> TestPe {
 }
 
 #[test]
+fn committed_private_stack_and_saved_nonvolatile_scheduling_preserve_state() {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind};
+    use std::collections::BTreeMap;
+    let code = [
+        0x48, 0x89, 0x4C, 0x24, 8, 0x48, 0x89, 0x54, 0x24, 16, // successful home-slot writes
+        0x53, 0x48, 0x83, 0xEC, 32, 0x90, // save rbx, allocate, end prologue
+        0x89, 0x44, 0x24, 48, 0x89, 0x4C, 0x24, 56, // independent private stores
+        0x8B, 0x44, 0x24, 48, 0x8B, 0x4C, 0x24, 56, 0x89, 0xC3, 0x89, 0xCA, 0x89, 0xD8, 0x48, 0x83,
+        0xC4, 32, 0x5B, 0xC3,
+    ];
+    let execute = |bytes: &[u8]| {
+        let mut regs = BTreeMap::from([
+            (Register::RAX, 101u64),
+            (Register::RCX, 303),
+            (Register::RDX, 707),
+            (Register::RBX, 999),
+            (Register::RSP, 0x1000),
+        ]);
+        let mut mem = BTreeMap::<u64, u8>::new();
+        let mut decoder = Decoder::with_ip(64, bytes, 0x140001000, DecoderOptions::NONE);
+        while decoder.can_decode() {
+            let i = decoder.decode();
+            let read = |reg: Register, regs: &BTreeMap<Register, u64>| {
+                let value = regs.get(&reg.full_register()).copied().unwrap_or(0);
+                if reg.is_gpr32() {
+                    value & 0xFFFFFFFF
+                } else {
+                    value
+                }
+            };
+            let address = regs[&Register::RSP].wrapping_add(i.memory_displacement64());
+            match i.mnemonic() {
+                Mnemonic::Nop => {}
+                Mnemonic::Mov => {
+                    let size = i.memory_size().size();
+                    let value = if i.op1_kind() == OpKind::Memory {
+                        (0..size).fold(0u64, |v, b| {
+                            v | ((*mem.get(&(address + b as u64)).unwrap_or(&0) as u64) << (8 * b))
+                        })
+                    } else {
+                        read(i.op1_register(), &regs)
+                    };
+                    if i.op0_kind() == OpKind::Memory {
+                        for b in 0..size {
+                            mem.insert(address + b as u64, (value >> (8 * b)) as u8);
+                        }
+                    } else {
+                        regs.insert(i.op0_register().full_register(), value);
+                    }
+                }
+                Mnemonic::Push => {
+                    let value = read(i.op0_register(), &regs);
+                    let sp = regs[&Register::RSP] - 8;
+                    regs.insert(Register::RSP, sp);
+                    for b in 0..8 {
+                        mem.insert(sp + b, (value >> (8 * b)) as u8);
+                    }
+                }
+                Mnemonic::Pop => {
+                    let sp = regs[&Register::RSP];
+                    let value = (0..8).fold(0u64, |v, b| {
+                        v | ((*mem.get(&(sp + b)).unwrap_or(&0) as u64) << (8 * b))
+                    });
+                    regs.insert(i.op0_register(), value);
+                    regs.insert(Register::RSP, sp + 8);
+                }
+                Mnemonic::Sub => {
+                    let sp = regs[&Register::RSP] - i.immediate(1);
+                    regs.insert(Register::RSP, sp);
+                }
+                Mnemonic::Add => {
+                    let sp = regs[&Register::RSP] + i.immediate(1);
+                    regs.insert(Register::RSP, sp);
+                }
+                Mnemonic::Ret => break,
+                _ => panic!("unexpected {i}"),
+            }
+        }
+        (regs, mem)
+    };
+    let mut fixture = metadata_fixture(&code);
+    fixture.data[0x880..0x888].copy_from_slice(&[1, 15, 2, 0, 15, 0x32, 11, 0x30]);
+    let pe = PeFile::parse(fixture.data).unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    let mut memory_moved = false;
+    let mut nonvolatile_moved = false;
+    for seed in 0..32 {
+        let mut data = pe.data.clone();
+        reorder::run(
+            &a,
+            pe.layout(),
+            &mut data,
+            &reorder::Config { probability: 1.0 },
+            &mut StdRng::seed_from_u64(seed),
+        );
+        let output = &data[0x400..0x400 + code.len()];
+        assert_eq!(execute(output), execute(&code));
+        assert_eq!(&output[..15], &code[..15]);
+        assert_eq!(&output[code.len() - 6..], &code[code.len() - 6..]);
+        memory_moved |= output[16..32] != code[16..32];
+        nonvolatile_moved |= output[32..38] != code[32..38];
+    }
+    assert!(memory_moved && nonvolatile_moved);
+}
+
+#[test]
 fn embedded_call_byte_does_not_split_metadata_function() {
     let pe = PeFile::parse(
         metadata_fixture(&[

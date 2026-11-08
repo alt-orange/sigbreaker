@@ -34,6 +34,22 @@ fn decode(code: &[u8]) -> Vec<Instr> {
 }
 
 #[test]
+fn faults_and_unmodeled_implicit_state_preserve_all_prior_and_later_effects() {
+    for middle in [
+        &[0x8B, 0x02][..],
+        &[0xF7, 0xF1][..],
+        &[0x0F, 0xAE, 0x12][..],
+    ] {
+        let mut code = vec![0x41, 0xB8, 1, 0, 0, 0];
+        code.extend_from_slice(middle);
+        code.extend_from_slice(&[0x41, 0xB9, 2, 0, 0, 0]);
+        let d = dependencies::build(&decode(&code));
+        assert!(d.deps[1].contains(&0));
+        assert!(d.deps[2].contains(&1));
+    }
+}
+
+#[test]
 fn conditional_branches_end_blocks_but_keep_fallthrough() {
     for code in [
         &[0x74, 0x00][..], // jz

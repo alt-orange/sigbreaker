@@ -40,10 +40,10 @@ with transformations intended to preserve behavior:\n\
   - segment selector injection (configurable whitelist, FS/GS off by default)\n\
   - DAG-based instruction reordering inside basic blocks\n\
   - basic block shuffling with explicit control-flow patching\n\n\
-Supported functions are rebuilt in the existing .text section, which can grow; \
-no code section is added. Standard PE references are rebased when needed. Unknown \
-address-bearing metadata can block a rebuild. Unsupported \
-exception formats stay pinned. Structural verification is not a proof of \
+Supported functions grow in .text or an appended section. Existing data RVAs \
+are preserved when opaque metadata prevents rebasing. Named FH3/FH4 and SEH \
+handlers, explicit static-handler maps, bounded indirect targets, and guarded \
+continuations are supported. Unknown formats stay pinned. Structural verification is not a proof of \
 behavioral equivalence."
 )]
 pub struct Cli {
@@ -53,6 +53,9 @@ pub struct Cli {
     /// Output path (defaults to `<input>.sigbrk.exe`).
     #[arg(short, long)]
     pub output: Option<PathBuf>,
+    /// Linker /MAP file establishing statically linked CRT handler identities.
+    #[arg(long)]
+    pub handler_map: Option<PathBuf>,
 
     /// Deterministic RNG seed (same seed + same binary = same output).
     #[arg(long, default_value_t = 0x5349_4752)]

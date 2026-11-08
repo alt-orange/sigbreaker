@@ -21,12 +21,15 @@
 
 pub mod analysis;
 pub mod cli;
+pub mod cpp_eh;
 pub mod dependencies;
 pub mod exception;
+pub mod indirect;
 pub mod pe;
 pub mod pipeline;
 pub mod rebuild;
 pub mod stats;
 pub mod transforms;
+pub mod unwind;
 pub mod verify;
 pub mod writer;

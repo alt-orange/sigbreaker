@@ -30,7 +30,7 @@ struct Cleanup {
     ~Cleanup() { ++count; }
 };
 
-__declspec(noinline) int exceptions() {
+extern "C" __declspec(dllexport) __declspec(noinline) int exceptions() {
     int count = 0;
     try {
         Cleanup outer{count};

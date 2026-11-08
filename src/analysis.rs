@@ -111,6 +111,8 @@ pub struct Function {
     pub chains: Vec<Chain>,
     /// Number of instructions found by the initial linear decode.
     pub instr_count: usize,
+    pub resolved_indirect: BTreeMap<u32, u32>,
+    pub jump_tables: Vec<crate::indirect::JumpTable>,
 }
 
 /// The result of lifting every executable section.
@@ -122,6 +124,8 @@ pub struct Analysis {
     branch_owners: BTreeMap<u32, Vec<usize>>,
     /// Direct call targets and known code-address references that must stay fixed.
     call_targets: BTreeSet<u32>,
+    /// Typed code-address materializations that can be rewritten after layout.
+    pub address_references: BTreeMap<u32, Vec<Instr>>,
 }
 
 impl Analysis {
@@ -129,8 +133,8 @@ impl Analysis {
     pub fn run(pe: &PeLayout, data: &[u8]) -> Result<Analysis> {
         let mut functions = Vec::new();
         let mut branch_owners: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-        let mut call_targets = pe.relocated_code_references(data);
-        call_targets.extend(pe.data_code_references(data));
+        let mut call_targets = BTreeSet::new();
+        let mut address_references = BTreeMap::<u32, Vec<Instr>>::new();
         call_targets.extend(pe.code_roots.iter().copied());
         let roots = if pe.runtime_functions.is_empty() {
             Self::discover_roots(pe, data)
@@ -157,7 +161,16 @@ impl Analysis {
                             .and_then(|v| u32::try_from(v).ok())
                         {
                             if pe.executable_sections().any(|s| s.contains_rva(rva)) {
-                                call_targets.insert(rva);
+                                if ins.iced.mnemonic() == iced_x86::Mnemonic::Lea
+                                    && crate::indirect::direct_address_use(&func, ins.rva)
+                                {
+                                    address_references.entry(rva).or_default().push(ins.clone());
+                                } else {
+                                    call_targets.insert(rva);
+                                    if pe.runtime_functions.iter().any(|f| f.start == rva) {
+                                        call_targets.insert(rva + 1);
+                                    }
+                                }
                             }
                         }
                     }
@@ -171,10 +184,17 @@ impl Analysis {
             }
         }
 
+        let table_bytes: Vec<_> = functions
+            .iter()
+            .flat_map(|f| f.jump_tables.iter().map(|t| t.bytes.clone()))
+            .collect();
+        call_targets.extend(pe.relocated_code_references_except(data, &table_bytes));
+        call_targets.extend(pe.data_code_references_except(data, &table_bytes));
         Ok(Analysis {
             functions,
             branch_owners,
             call_targets,
+            address_references,
         })
     }
 
@@ -195,6 +215,13 @@ impl Analysis {
     /// Targets can lie inside a block, including inside an instruction; in
     /// that case the entire containing span must retain its byte layout.
     pub fn range_externally_referenced(&self, f_idx: usize, range: Range<u32>) -> bool {
+        self.address_references
+            .range(range.clone())
+            .next()
+            .is_some()
+            || self.range_unrewritable_reference(f_idx, range)
+    }
+    pub fn range_unrewritable_reference(&self, f_idx: usize, range: Range<u32>) -> bool {
         if range.start >= range.end {
             return false;
         }
@@ -351,6 +378,28 @@ impl Analysis {
         if instrs.is_empty() {
             return None;
         }
+        let resolved_indirect = crate::indirect::resolve(
+            pe,
+            &instrs,
+            pe.eh_continuations.iter().copied().chain(
+                pe.cpp_eh
+                    .get(&base_rva)
+                    .into_iter()
+                    .flat_map(|i| i.continuations.iter().copied()),
+            ),
+        );
+        let entries = pe
+            .eh_continuations
+            .iter()
+            .copied()
+            .chain(
+                pe.cpp_eh
+                    .get(&base_rva)
+                    .into_iter()
+                    .flat_map(|i| i.continuations.iter().copied()),
+            )
+            .collect();
+        let jump_tables = crate::indirect::tables(pe, data, &instrs, &entries);
         // Metadata-backed extents may contain inline data and jump tables.
         // Only instructions reached from the entry through decoded edges can
         // be rewritten. Unknown indirect destinations stay untouched.
@@ -361,6 +410,18 @@ impl Analysis {
                 .map(|(i, ins)| (ins.rva, i))
                 .collect();
             let mut pending = vec![base_rva];
+            pending.extend(
+                pe.eh_continuations
+                    .range(base_rva..base_rva + region_len as u32)
+                    .copied(),
+            );
+            if let Some(info) = pe.cpp_eh.get(&base_rva) {
+                pending.extend(
+                    info.continuations
+                        .range(base_rva..base_rva + region_len as u32)
+                        .copied(),
+                );
+            }
             if let Some(info) = pe.c_specific.get(&base_rva) {
                 pending.extend(
                     info.scopes
@@ -385,6 +446,12 @@ impl Analysis {
                 if let Some(target) = ins.branch_target_rva(pe.image_base) {
                     pending.push(target);
                 }
+                if let Some(&target) = resolved_indirect.get(&ins.rva) {
+                    pending.push(target);
+                }
+                for table in jump_tables.iter().filter(|t| t.branch == ins.rva) {
+                    pending.extend(table.targets.iter().copied());
+                }
                 if ins.falls_through() {
                     pending.push(ins.rva + ins.len as u32);
                 }
@@ -405,6 +472,8 @@ impl Analysis {
             .iter()
             .filter(|i| i.is_direct_branch())
             .filter_map(|i| i.branch_target_rva(pe.image_base))
+            .chain(resolved_indirect.values().copied())
+            .chain(jump_tables.iter().flat_map(|t| t.targets.iter().copied()))
             .collect();
         for t in &targets {
             branch_owners.entry(*t).or_default().push(f_idx);
@@ -423,6 +492,11 @@ impl Analysis {
             if k > 0
                 && (targets.contains(&ins.rva)
                     || scope_boundaries.contains(&ins.rva)
+                    || pe.eh_continuations.contains(&ins.rva)
+                    || pe
+                        .cpp_eh
+                        .get(&base_rva)
+                        .is_some_and(|i| i.continuations.contains(&ins.rva))
                     || instrs[k - 1].ends_block())
             {
                 bounds.insert(k);
@@ -468,6 +542,8 @@ impl Analysis {
             instr_count: instrs.len(),
             blocks,
             chains,
+            resolved_indirect,
+            jump_tables,
         })
     }
 }

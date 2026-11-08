@@ -40,7 +40,7 @@ lines += ['', '## Modes and coverage', '',
 for name, covered in result.get('relocated_stackwalk_coverage', {}).items():
     rows = [row for row in variants if row['target'] == name and row.get('relocated_stackwalk')]
     lines.append(f'- {name}: relocated stack-walk coverage = {covered}; {len(rows)} variants have '
-                 'an exported walk entry reaching rewritten code inside `.text`, a corresponding runtime-function entry, '
+                 'an exported walk entry reaching rewritten executable code, a corresponding runtime-function entry, '
                  'and runtime results in `results.json`.')
 benchmark_file = directory / 'benchmark.json'
 stress_file = directory / 'exception-layouts.json'
@@ -79,8 +79,11 @@ lines += ['', '## Evidence and limits', '',
           '`benchmark.json` retains every measured sample. Original hashes are checked after the runtime matrix.', '',
           'This finite test matrix does not prove arbitrary-binary equivalence. Recognized C-specific SEH '
           'scope tables are rewritten. Supported secondary chains reuse their unchanged records and pinned '
-          'primary. C++ FH3/FH4, unknown handlers, newer unwind formats, and general indirect dispatch '
-          'remain unsupported.', '']
+          'primary. Named FH3/FH4, explicitly mapped static handlers, unwind V2, bounded jump tables, '
+          'and guarded continuations have separate structural/runtime checks. Opaque handlers can be '
+          'preserved through the append fallback. Unwind V3, arbitrary indirect dispatch, and general '
+          'reference closure remain unsupported. These main-matrix results alone do not establish '
+          'actual C++ handler relocation; use validate_cpp_layouts.py for that evidence.', '']
 output = directory / 'REPORT.md'
 output.write_text('\n'.join(lines), encoding='utf-8')
 print(output)

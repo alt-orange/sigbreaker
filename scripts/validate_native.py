@@ -10,7 +10,7 @@ import struct
 import subprocess
 import sys
 import time
-from pe_fixture_checks import relocated_export, section_names
+from pe_fixture_checks import relocated_export, check_section_preservation
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser()
@@ -205,7 +205,7 @@ for name, original, cases in targets:
             else:
                 row["sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
                 before, after = original.read_bytes(), output.read_bytes()
-                assert section_names(before) == section_names(after), 'output added or renamed a section'
+                row['layout_strategy'] = check_section_preservation(before, after)
                 row["changed_bytes"] = sum(a != b for a, b in zip(before, after))
                 row["same_size"] = len(before) == len(after)
                 row["input_bytes"] = len(before)
@@ -256,6 +256,6 @@ print(f"SUMMARY {summary}", flush=True)
 print(f"RESULTS {RUN / 'results.json'}", flush=True)
 print(f"RELOCATED STACK WALK {result['relocated_stackwalk_coverage']}", flush=True)
 print(f"RELOCATED EXCEPTIONS {result['relocated_exception_coverage']}", flush=True)
-raise SystemExit(0 if all(r["status"] in ("passed", 'unsupported_rebuild') for r in result["variants"])
+raise SystemExit(0 if all(r["status"] == "passed" for r in result["variants"])
                  and all(value is not False for value in result['relocated_stackwalk_coverage'].values())
                  and all(result['relocated_exception_coverage'].values()) else 1)

@@ -15,6 +15,8 @@ pub struct Counters {
     /// Items actually transformed.
     pub applied: u64,
     pub relocated_c_specific: u64,
+    pub relocated_fh3: u64,
+    pub relocated_fh4: u64,
     pub relocated_chained: u64,
     pub relocated_import_tails: u64,
     /// Instructions whose bytes were rewritten or relocated in place.
@@ -38,6 +40,8 @@ impl Counters {
         };
         push("applied", self.applied);
         push("C-specific SEH functions", self.relocated_c_specific);
+        push("C++ FH3 functions", self.relocated_fh3);
+        push("C++ FH4 functions", self.relocated_fh4);
         push("chained unwind functions", self.relocated_chained);
         push("import-tail functions", self.relocated_import_tails);
         push("skipped (unwind/exception metadata)", self.skipped_metadata);

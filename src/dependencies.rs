@@ -64,19 +64,52 @@ fn is_barrier(ins: &Instruction) -> bool {
     ) {
         return true;
     }
-    matches!(
+    // Everything outside this integer subset may fault or expose implicit
+    // x87/MXCSR/system state that this DAG does not model.
+    !matches!(
         ins.mnemonic(),
-        Mnemonic::Mfence
-            | Mnemonic::Sfence
-            | Mnemonic::Lfence
-            | Mnemonic::Cpuid
-            | Mnemonic::Rdtsc
-            | Mnemonic::Rdtscp
+        Mnemonic::Mov
+            | Mnemonic::Movzx
+            | Mnemonic::Movsx
+            | Mnemonic::Movsxd
+            | Mnemonic::Lea
+            | Mnemonic::Add
+            | Mnemonic::Adc
+            | Mnemonic::Sub
+            | Mnemonic::Sbb
+            | Mnemonic::And
+            | Mnemonic::Or
+            | Mnemonic::Xor
+            | Mnemonic::Not
+            | Mnemonic::Neg
+            | Mnemonic::Inc
+            | Mnemonic::Dec
+            | Mnemonic::Cmp
+            | Mnemonic::Test
+            | Mnemonic::Imul
+            | Mnemonic::Shl
+            | Mnemonic::Shr
+            | Mnemonic::Sar
+            | Mnemonic::Rol
+            | Mnemonic::Ror
+            | Mnemonic::Rcl
+            | Mnemonic::Rcr
+            | Mnemonic::Bswap
+            | Mnemonic::Stc
+            | Mnemonic::Clc
+            | Mnemonic::Cmc
+            | Mnemonic::Nop
     )
 }
 
 /// Builds the dependency DAG for one basic block's instruction sequence.
 pub fn build(instrs: &[Instr]) -> Dag {
+    build_with_stack_policy(instrs, false)
+}
+pub(crate) fn build_private_stack(instrs: &[Instr]) -> Dag {
+    build_with_stack_policy(instrs, true)
+}
+fn build_with_stack_policy(instrs: &[Instr], private_stack: bool) -> Dag {
     let n = instrs.len();
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
 
@@ -102,6 +135,10 @@ pub fn build(instrs: &[Instr]) -> Dag {
     let mut factory = InstructionInfoFactory::new();
     for (i, item) in instrs.iter().enumerate() {
         let info = factory.info(&item.iced);
+        let touches_memory = info
+            .used_memory()
+            .iter()
+            .any(|m| !matches!(m.access(), OpAccess::None | OpAccess::NoMemAccess));
 
         let seg_write = info.used_registers().iter().any(|r| {
             writes(r.access())
@@ -122,7 +159,7 @@ pub fn build(instrs: &[Instr]) -> Dag {
             add_edge(&mut deps, b, i);
         }
 
-        if is_barrier(&item.iced) || seg_write {
+        if is_barrier(&item.iced) || seg_write || (touches_memory && !private_stack) {
             for j in 0..i {
                 add_edge(&mut deps, j, i);
             }
@@ -177,13 +214,22 @@ pub fn build(instrs: &[Instr]) -> Dag {
         }
 
         // Memory ordering: a conservative total order among memory accesses.
-        let touches_memory = info
-            .used_memory()
-            .iter()
-            .any(|m| !matches!(m.access(), OpAccess::None | OpAccess::NoMemAccess));
         if touches_memory {
             for &m in &mem_ops {
-                add_edge(&mut deps, m, i);
+                let a = &instrs[m].iced;
+                let b = &item.iced;
+                let disjoint = private_stack
+                    && a.memory_base() == Register::RSP
+                    && b.memory_base() == Register::RSP
+                    && a.memory_index() == Register::None
+                    && b.memory_index() == Register::None
+                    && (a.memory_displacement64() as u128 + a.memory_size().size() as u128
+                        <= b.memory_displacement64() as u128
+                        || b.memory_displacement64() as u128 + b.memory_size().size() as u128
+                            <= a.memory_displacement64() as u128);
+                if !disjoint {
+                    add_edge(&mut deps, m, i);
+                }
             }
             mem_ops.push(i);
         }

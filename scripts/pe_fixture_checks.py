@@ -31,7 +31,7 @@ def relocated_export(data, export_name):
         if data[at] != 0xE9:
             return None
         target = rva + 5 + struct.unpack_from('<i', data, at + 1)[0]
-        if not any(name == b'.text' and base <= target < base + size for name, size, base, _, _ in sections):
+        if not any((name == b'.text' or name.startswith(b'.sbrk')) and base <= target < base + size for name, size, base, _, _ in sections):
             return None
         runtime, size = struct.unpack_from('<II', data, opt + 112 + 3 * 8)
         entries = [struct.unpack_from('<III', data, offset(runtime) + index) for index in range(0, size, 12)]
@@ -50,4 +50,10 @@ def section_names(data):
     count = struct.unpack_from('<H', data, pe + 6)[0]
     table = pe + 24 + struct.unpack_from('<H', data, pe + 20)[0]
     return [data[table + i * 40:table + i * 40 + 8] for i in range(count)]
-    raise AssertionError(f'Missing fixture export: {export_name}')
+
+
+def check_section_preservation(before, after):
+    old, new = section_names(before), section_names(after)
+    assert new[:len(old)] == old, 'writer removed or renamed an existing section'
+    assert all(name.startswith(b'.sbrk') for name in new[len(old):]), 'unexpected generated section'
+    return 'append_section' if len(new) > len(old) else 'rebuild_text'

@@ -28,6 +28,14 @@ pub fn run(cli: &Cli) -> Result<String> {
     let raw = std::fs::read(&cli.input)
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
     let mut pe = PeFile::parse(raw)?;
+    if let Some(path) = &cli.handler_map {
+        let symbols = crate::exception::map_symbols(
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?,
+            pe.layout().image_base,
+        )?;
+        pe = PeFile::parse_with_symbols(pe.data, symbols)?;
+    }
     let layout = pe.layout().clone();
 
     let mut rng = StdRng::seed_from_u64(cli.seed);
@@ -139,7 +147,7 @@ pub fn run(cli: &Cli) -> Result<String> {
             )?;
             pass(
                 "basic block relocation",
-                "rebuilt .text, explicit jumps, updated runtime-function table".into(),
+                "explicit jumps, updated runtime-function table, preserved opaque metadata".into(),
                 c,
             );
         } else {
@@ -170,7 +178,9 @@ pub fn run(cli: &Cli) -> Result<String> {
         .iter()
         .filter(|func| {
             let range = func.off..func.off + (func.end_rva - func.start_rva) as usize;
-            original_data[range.clone()] != pe.data[range]
+            pe.layout()
+                .rva_to_offset(func.start_rva)
+                .is_some_and(|off| original_data[range.clone()] != pe.data[off..off + range.len()])
         })
         .count();
     let total = analysis.functions.len();

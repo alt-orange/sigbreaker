@@ -63,7 +63,14 @@ pub struct PeLayout {
     /// Code ranges whose original unwind addresses are referenced by chains.
     pub metadata_pinned: Vec<Range<u32>>,
     pub c_specific: BTreeMap<u32, crate::exception::CSpecific>,
+    pub cpp_eh: BTreeMap<u32, crate::cpp_eh::CppEh>,
+    pub handler_symbols: BTreeMap<u32, String>,
+    pub gs_handlers: BTreeMap<u32, Vec<u8>>,
     pub guarded_eh_continuations: bool,
+    /// Sorted IMAGE_LOAD_CONFIG_DIRECTORY64 GuardEHContinuationTable entries.
+    pub eh_continuation_table: Option<Range<usize>>,
+    pub eh_continuation_fields: Option<(usize, usize)>,
+    pub eh_continuations: BTreeSet<u32>,
     pub import_slots: BTreeSet<u32>,
     unwind: BTreeMap<u32, UnwindInfo>,
     /// File-offset ranges the loader patches via `.reloc`; never touch these.
@@ -80,6 +87,7 @@ pub struct UnwindInfo {
     /// Handler-bearing, chained, and newer formats remain pinned.
     pub permits_register_reordering: bool,
     pub kind: UnwindKind,
+    pub v2: Option<crate::unwind::V2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,9 +154,19 @@ impl PeLayout {
 
     /// Conservative address-taken references carried by absolute base fixups.
     pub fn relocated_code_references(&self, data: &[u8]) -> BTreeSet<u32> {
+        self.relocated_code_references_except(data, &[])
+    }
+    pub fn relocated_code_references_except(
+        &self,
+        data: &[u8],
+        owned: &[Range<usize>],
+    ) -> BTreeSet<u32> {
         self.protected
             .iter()
             .filter_map(|r| {
+                if owned.iter().any(|o| o.start <= r.start && r.end <= o.end) {
+                    return None;
+                }
                 let bytes: [u8; 8] = data.get(r.start..r.start + 8)?.try_into().ok()?;
                 let rva = u64::from_le_bytes(bytes).checked_sub(self.image_base)?;
                 let rva = u32::try_from(rva).ok()?;
@@ -162,6 +180,13 @@ impl PeLayout {
     /// Conservative RVA and VA pointer-table analysis. Values are candidates,
     /// not proof of an executable edge; false positives only restrict movement.
     pub fn data_code_references(&self, data: &[u8]) -> BTreeSet<u32> {
+        self.data_code_references_except(data, &[])
+    }
+    pub fn data_code_references_except(
+        &self,
+        data: &[u8],
+        owned: &[Range<usize>],
+    ) -> BTreeSet<u32> {
         let mut targets = BTreeSet::new();
         for section in self
             .sections
@@ -170,10 +195,21 @@ impl PeLayout {
         {
             let range = self.section_raw_range(section, data.len());
             for at in (range.start..range.end).step_by(4) {
+                if owned.iter().any(|r| r.contains(&at)) {
+                    continue;
+                }
                 if self
                     .c_specific
                     .values()
                     .any(|info| info.table_bytes.contains(&at))
+                    || self
+                        .eh_continuation_table
+                        .as_ref()
+                        .is_some_and(|r| r.contains(&at))
+                    || self
+                        .cpp_eh
+                        .values()
+                        .any(|i| i.owned.iter().any(|r| r.contains(&at)))
                 {
                     continue;
                 }
@@ -209,6 +245,12 @@ pub struct PeFile {
 impl PeFile {
     /// Parses headers and validates this is a 64-bit x86 PE image.
     pub fn parse(data: Vec<u8>) -> Result<PeFile> {
+        Self::parse_with_symbols(data, BTreeMap::new())
+    }
+    pub fn parse_with_symbols(
+        data: Vec<u8>,
+        handler_symbols: BTreeMap<u32, String>,
+    ) -> Result<PeFile> {
         let len = data.len();
         if len < 0x40 {
             bail!("file too small to be a PE image ({len} bytes)");
@@ -306,7 +348,13 @@ impl PeFile {
             code_roots: BTreeSet::from([entry_rva]),
             metadata_pinned: Vec::new(),
             c_specific: BTreeMap::new(),
+            cpp_eh: BTreeMap::new(),
+            handler_symbols: handler_symbols.clone(),
+            gs_handlers: BTreeMap::new(),
             guarded_eh_continuations: false,
+            eh_continuation_table: None,
+            eh_continuation_fields: None,
+            eh_continuations: BTreeSet::new(),
             import_slots: BTreeSet::new(),
             unwind: BTreeMap::new(),
         };
@@ -355,6 +403,62 @@ impl PeFile {
             false
         };
         let mut c_specific = BTreeMap::new();
+        let mut cpp_eh = BTreeMap::new();
+        let mut gs_handlers = BTreeMap::new();
+        if handler_symbols
+            .keys()
+            .any(|r| !layout.executable_sections().any(|s| s.contains_rva(*r)))
+        {
+            bail!("linker-map handler outside executable image");
+        }
+        let mut eh_continuations = BTreeSet::new();
+        let mut eh_continuation_table = None;
+        let mut eh_continuation_fields = None;
+        if let Some(config) = directory(10)? {
+            let declared = u32_le(&data, config.start)? as usize;
+            if declared > config.len() {
+                bail!("truncated load config");
+            }
+            if declared >= 280 {
+                eh_continuation_fields = Some((config.start + 264, config.start + 272));
+                let va = u64_le(&data, config.start + 264)?;
+                let count = u64_le(&data, config.start + 272)?;
+                if (va == 0) != (count == 0) {
+                    bail!("incomplete guarded EH continuation table");
+                }
+                if count != 0 {
+                    if count > data.len() as u64 / 4 {
+                        bail!("invalid guarded EH continuation count");
+                    }
+                    let rva = u32::try_from(
+                        va.checked_sub(layout.image_base)
+                            .context("guard EH table VA")?,
+                    )?;
+                    let start = layout
+                        .rva_to_offset(rva)
+                        .context("unmapped guard EH table")?;
+                    let size = count as usize * 4;
+                    let last = rva
+                        .checked_add(u32::try_from(size - 1)?)
+                        .context("guard EH table overflow")?;
+                    if layout.rva_to_offset(last) != Some(start + size - 1) {
+                        bail!("noncontiguous guard EH table");
+                    }
+                    let mut previous = None;
+                    for at in (start..start + size).step_by(4) {
+                        let target = u32_le(&data, at)?;
+                        if previous.is_some_and(|old| old >= target)
+                            || !layout.executable_sections().any(|s| s.contains_rva(target))
+                        {
+                            bail!("invalid guarded EH continuation target");
+                        }
+                        previous = Some(target);
+                        eh_continuations.insert(target);
+                    }
+                    eh_continuation_table = Some(start..start + size);
+                }
+            }
+        }
         if let Some(exports) = directory(0)? {
             if exports.len() < 40 {
                 bail!("truncated export directory");
@@ -409,14 +513,22 @@ impl PeFile {
                 let prologue_end = start
                     .checked_add(bytes[1] as u32)
                     .context("prologue overflow")?;
-                if version == 1 && prologue_end > end {
+                if matches!(version, 1 | 2) && prologue_end > end {
                     bail!("prologue exceeds function extent");
                 }
                 let slots_end = header + 4 + (bytes[2] as usize).div_ceil(2) * 4;
-                if version == 1 && slots_end > data.len() {
+                if matches!(version, 1 | 2) && slots_end > data.len() {
                     bail!("truncated unwind codes");
                 }
-                let kind = if version == 1 && flags & !7 == 0 {
+                let v2 = if version == 2 {
+                    Some(crate::unwind::V2::parse(
+                        &data[header..slots_end],
+                        start..end,
+                    )?)
+                } else {
+                    None
+                };
+                let kind = if matches!(version, 1 | 2) && flags & !7 == 0 {
                     if flags & 4 != 0 {
                         if flags & 3 != 0 {
                             bail!("chained unwind record also declares a handler");
@@ -445,20 +557,68 @@ impl PeFile {
                         let data_rva = unwind_rva
                             .checked_add((slots_end + 4 - header) as u32)
                             .context("handler data overflow")?;
-                        if crate::exception::is_c_specific(&layout, &data, &imports, handler_rva) {
-                            let scopes = crate::exception::parse(
+                        let identity = handler_symbols.get(&handler_rva).cloned().or_else(|| {
+                            crate::exception::handler_name(&layout, &data, &imports, handler_rva)
+                        });
+                        if matches!(
+                            identity.as_deref(),
+                            Some("__C_specific_handler" | "__GSHandlerCheck_SEH")
+                        ) {
+                            let mut scopes = crate::exception::parse(
                                 &layout,
                                 &data,
                                 start..end,
                                 handler_rva,
                                 data_rva,
                             )?;
+                            if identity.as_deref() == Some("__GSHandlerCheck_SEH") {
+                                let gs_rva = data_rva
+                                    .checked_add(u32::try_from(scopes.table_bytes.len())?)
+                                    .context("GS SEH trailer overflow")?;
+                                scopes.gs_data = crate::exception::gs_data(&layout, &data, gs_rva)?;
+                            }
                             for scope in &scopes.scopes {
                                 if scope.handler > 1 {
                                     code_roots.insert(scope.handler);
                                 }
                             }
                             c_specific.insert(start, scopes);
+                        }
+                        if matches!(
+                            identity.as_deref(),
+                            Some(
+                                "__CxxFrameHandler3"
+                                    | "__CxxFrameHandler4"
+                                    | "__GSHandlerCheck_EH"
+                                    | "__GSHandlerCheck_EH4"
+                            )
+                        ) {
+                            let mut info = crate::cpp_eh::parse(
+                                &layout,
+                                &data,
+                                start..end,
+                                handler_rva,
+                                data_rva,
+                                matches!(
+                                    identity.as_deref(),
+                                    Some("__CxxFrameHandler4" | "__GSHandlerCheck_EH4")
+                                ),
+                            )?;
+                            if identity.as_deref().is_some_and(|s| s.starts_with("__GS")) {
+                                info.gs_data = crate::exception::gs_data(
+                                    &layout,
+                                    &data,
+                                    data_rva.checked_add(4).context("GS C++ trailer overflow")?,
+                                )?;
+                            }
+                            code_roots.extend(info.roots.iter().copied());
+                            cpp_eh.insert(start, info);
+                        }
+                        if identity.as_deref() == Some("__GSHandlerCheck") {
+                            gs_handlers.insert(
+                                start,
+                                crate::exception::gs_data(&layout, &data, data_rva)?,
+                            );
                         }
                         UnwindKind::Handler {
                             flags,
@@ -482,6 +642,7 @@ impl PeFile {
                             && flags == 0
                             && unwind_rva % 4 == 0,
                         kind,
+                        v2,
                     },
                 );
             }
@@ -523,7 +684,12 @@ impl PeFile {
                 code_roots,
                 metadata_pinned,
                 c_specific,
+                cpp_eh,
+                gs_handlers,
                 guarded_eh_continuations,
+                eh_continuation_table,
+                eh_continuation_fields,
+                eh_continuations,
                 import_slots: imports.keys().copied().collect(),
                 ..layout
             },

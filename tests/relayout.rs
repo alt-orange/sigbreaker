@@ -25,6 +25,248 @@ fn fixture_code(code: &[u8]) -> PeFile {
 }
 
 #[test]
+fn bounded_absolute_rva_and_relative_jump_tables_follow_relocated_cases() {
+    for kind in 0..3 {
+        let dispatch: Vec<u8> = match kind {
+            0 => vec![0x48, 0x8D, 0x15, 0xF3, 0x0F, 0, 0, 0xFF, 0x24, 0xCA],
+            1 => vec![
+                0x48, 0x8D, 0x15, 0xF3, 0xEF, 0xFF, 0xFF, 0x8B, 0x84, 0x8A, 0, 0x20, 0, 0, 0x48,
+                0x01, 0xD0, 0xFF, 0xE0,
+            ],
+            _ => vec![
+                0x48, 0x8D, 0x15, 0xF3, 0x0F, 0, 0, 0x48, 0x63, 0x04, 0x8A, 0x48, 0x01, 0xD0, 0xFF,
+                0xE0,
+            ],
+        };
+        let first = 0x1006 + dispatch.len() as u32;
+        let mut code = vec![0x48, 0x83, 0xF9, 1, 0x77, (dispatch.len() + 12) as u8];
+        code.extend(dispatch);
+        for value in [11u8, 22, 33] {
+            code.extend_from_slice(&[0xB8, value, 0, 0, 0, 0xC3]);
+        }
+        let mut data = fixture_code(&code).data;
+        data[0x800..0x820].fill(0);
+        for (i, target) in [first, first + 6].iter().enumerate() {
+            match kind {
+                0 => data[0x800 + i * 8..0x808 + i * 8]
+                    .copy_from_slice(&(0x140000000u64 + *target as u64).to_le_bytes()),
+                1 => data[0x800 + i * 4..0x804 + i * 4].copy_from_slice(&target.to_le_bytes()),
+                _ => data[0x800 + i * 4..0x804 + i * 4]
+                    .copy_from_slice(&(*target as i32 - 0x2000).to_le_bytes()),
+            }
+        }
+        if kind == 0 {
+            data[0xC08..0xC0A].copy_from_slice(&0xA000u16.to_le_bytes());
+            data[0xC0A..0xC0C].copy_from_slice(&0xA008u16.to_le_bytes());
+        } else {
+            data[0xF0..0xF8].fill(0);
+        }
+        let mut pe = PeFile::parse(data.clone()).unwrap();
+        let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+        assert_eq!(a.functions[0].jump_tables.len(), 1, "kind {kind}");
+        let c = relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+        assert_eq!(c.applied, 1, "kind {kind}: {c}");
+        let table = pe.layout().rva_to_offset(0x2000).unwrap();
+        for i in 0..2 {
+            let target = match kind {
+                0 => {
+                    (u64::from_le_bytes(
+                        pe.data[table + i * 8..table + i * 8 + 8]
+                            .try_into()
+                            .unwrap(),
+                    ) - pe.layout().image_base) as u32
+                }
+                1 => u32::from_le_bytes(
+                    pe.data[table + i * 4..table + i * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                ),
+                _ => {
+                    (0x2000i64
+                        + i32::from_le_bytes(
+                            pe.data[table + i * 4..table + i * 4 + 4]
+                                .try_into()
+                                .unwrap(),
+                        ) as i64) as u32
+                }
+            };
+            assert!(target >= 0x4000);
+            let at = pe.layout().rva_to_offset(target).unwrap();
+            assert_eq!(
+                &pe.data[at..at + 5],
+                &[0xB8, if i == 0 { 11 } else { 22 }, 0, 0, 0]
+            );
+        }
+        // No bound, or a join into the dispatch, must not establish a table.
+        data[0x404] = 0xEB;
+        let pe = PeFile::parse(data).unwrap();
+        let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+        assert!(a.functions[0].jump_tables.is_empty());
+    }
+}
+
+#[test]
+fn opaque_metadata_fallback_expands_headers_and_preserves_rvas_and_overlay() {
+    let mut data = fixture().data;
+    // A second region has an unknown language handler. It must remain intact.
+    data[0x480..0x486].copy_from_slice(&[0xB8, 9, 0, 0, 0, 0xC3]);
+    for (at, value) in [
+        (0xE4, 24u32),
+        (0x84C, 0x1080),
+        (0x850, 0x1086),
+        (0x854, 0x2090),
+        (0x894, 0x1080),
+    ] {
+        data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    data[0x890] = 9;
+    data[0x898..0x8A8].copy_from_slice(b"opaque-EH-data!!");
+    // Occupied header padding must be preserved, so a new header needs space.
+    data[0x1C0..0x1E8].fill(0xAB);
+    let overlay = data.len() as u32;
+    data[0xE8..0xEC].copy_from_slice(&overlay.to_le_bytes());
+    data[0xEC..0xF0].copy_from_slice(&16u32.to_le_bytes());
+    data.extend_from_slice(b"certificate-data");
+    let before = PeFile::parse(data).unwrap();
+    let mut pe = PeFile::parse(before.data.clone()).unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    let counters = relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+    assert_eq!(counters.applied, 1);
+    assert_eq!(pe.layout().sections.len(), 4);
+    for (old, new) in before.layout().sections.iter().zip(&pe.layout().sections) {
+        assert_eq!(old.virtual_address, new.virtual_address);
+        assert_eq!(new.raw_ptr, old.raw_ptr + 0x200);
+    }
+    assert_eq!(&pe.data[0x3C0..0x3E8], &[0xAB; 40]);
+    let opaque = pe.layout().rva_to_offset(0x2090).unwrap();
+    assert_eq!(&pe.data[opaque..opaque + 24], &before.data[0x890..0x8A8]);
+    let old_entry = pe.layout().rva_to_offset(0x1000).unwrap();
+    assert_eq!(pe.data[old_entry], 0xE9);
+    assert_eq!(
+        &pe.data[old_entry + 5..old_entry + 16],
+        &before.data[0x405..0x410]
+    );
+    let certificate = u32::from_le_bytes(pe.data[0xE8..0xEC].try_into().unwrap()) as usize;
+    assert_eq!(&pe.data[certificate..certificate + 16], b"certificate-data");
+    assert!(pe
+        .layout()
+        .runtime_functions
+        .iter()
+        .any(|r| r.start == 0x1000));
+    // Reprocessing appends another uniquely named section and preserves lookup.
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(7)).unwrap();
+    assert_eq!(pe.layout().sections.last().unwrap().name(), ".sbrk1");
+}
+
+#[test]
+fn resolved_register_jump_rewrites_its_interior_lea_target() {
+    let code = [
+        0x85, 0xC9, 0x74, 12, 0x48, 0x8D, 0x05, 11, 0, 0, 0, 0x48, 0x89, 0xC2, 0xFF, 0xE2, 0xB8, 1,
+        0, 0, 0, 0xC3, 0xB8, 2, 0, 0, 0, 0xC3,
+    ];
+    let mut pe = fixture_code(&code);
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    assert_eq!(a.functions[0].resolved_indirect.get(&0x100E), Some(&0x1016));
+    let c = relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+    assert_eq!(c.applied, 1, "{c}");
+    let moved = pe.layout().runtime_functions.last().unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    let f = a
+        .functions
+        .iter()
+        .find(|f| f.start_rva == moved.start)
+        .unwrap();
+    assert_eq!(f.resolved_indirect.len(), 1);
+    let target = *f.resolved_indirect.values().next().unwrap();
+    assert!(moved.contains(&target));
+    let at = pe.layout().rva_to_offset(target).unwrap();
+    let ins = Decoder::with_ip(
+        64,
+        &pe.data[at..],
+        pe.layout().va(target),
+        DecoderOptions::NONE,
+    )
+    .decode();
+    assert_eq!(ins.mnemonic(), Mnemonic::Mov);
+    assert_eq!(ins.immediate32(), 2);
+}
+
+#[test]
+fn external_rip_lea_to_an_interior_instruction_is_rewritten() {
+    let mut data = fixture().data;
+    for (at, value) in [
+        (0xE4, 24u32),
+        (0x84C, 0x1080),
+        (0x850, 0x1088),
+        (0x854, 0x2090),
+    ] {
+        data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    data[0x890] = 1;
+    data[0x480..0x488].copy_from_slice(&[0x48, 0x8D, 0x05, 0x83, 0xFF, 0xFF, 0xFF, 0xC3]); // lea rax,[0x100A]
+    let mut pe = PeFile::parse(data).unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    assert!(a.address_references.contains_key(&0x100A));
+    let c = relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+    assert_eq!(c.applied, 1, "{c}");
+    let source = pe.layout().rva_to_offset(0x1080).unwrap();
+    let ins = Decoder::with_ip(
+        64,
+        &pe.data[source..],
+        pe.layout().va(0x1080),
+        DecoderOptions::NONE,
+    )
+    .decode();
+    let target = (ins.ip_rel_memory_address() - pe.layout().image_base) as u32;
+    assert!(target >= 0x4000);
+    let at = pe.layout().rva_to_offset(target).unwrap();
+    assert_eq!(&pe.data[at..at + 5], &[0xB8, 2, 0, 0, 0]);
+}
+
+#[test]
+fn version_two_epilogue_distances_follow_shuffled_blocks() {
+    let code = [
+        0x48, 0x83, 0xEC, 0x28, 0x85, 0xC9, 0x74, 10, 0xB8, 1, 0, 0, 0, 0x48, 0x83, 0xC4, 0x28,
+        0xC3, 0xB8, 2, 0, 0, 0, 0x48, 0x83, 0xC4, 0x28, 0xC3,
+    ];
+    let mut data = fixture_code(&code).data;
+    data[0x880..0x88C].copy_from_slice(&[2, 4, 5, 0, 1, 6, 11, 6, 1, 6, 0, 6]);
+    data[0x88C..0x890].copy_from_slice(&[4, 0x42, 0, 0]);
+    // Five slots: size=1 (RET), two explicit end distances, padding, alloc.
+    let mut pe = PeFile::parse(data).unwrap();
+    assert_eq!(
+        pe.layout()
+            .unwind_info(0x1000)
+            .unwrap()
+            .v2
+            .as_ref()
+            .unwrap()
+            .epilogues
+            .len(),
+        2
+    );
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    let c = relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+    assert_eq!(c.applied, 1, "{c}");
+    let f = pe.layout().runtime_functions.last().unwrap();
+    let v2 = pe
+        .layout()
+        .unwind_info(f.start)
+        .unwrap()
+        .v2
+        .as_ref()
+        .unwrap();
+    assert_eq!(v2.epilogues.len(), 2);
+    for epilogue in &v2.epilogues {
+        assert_eq!(
+            pe.data[pe.layout().rva_to_offset(epilogue.start).unwrap()],
+            0xC3
+        );
+    }
+}
+
+#[test]
 fn relocation_preserves_padded_msvc_prologue_and_epilogues() {
     let code = [
         0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, // padded push rbx; sub rsp,32

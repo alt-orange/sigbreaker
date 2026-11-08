@@ -105,7 +105,7 @@ pub fn encode_function(
             Ok(*instruction)
         })
         .collect::<Result<_>>()?;
-    let encoded = BlockEncoder::encode(
+    let mut encoded = BlockEncoder::encode(
         64,
         InstructionBlock::new(&encoding, new_ip),
         BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS
@@ -134,6 +134,27 @@ pub fn encode_function(
         let mut decoded = decoder.decode();
         if decoded.is_invalid() {
             bail!("invalid generated instruction");
+        }
+        if original.mnemonic() == Mnemonic::Lea && original.is_ip_rel_memory_operand() {
+            let target = original.ip_rel_memory_address();
+            if let Some(&mapped_target) = map.get(&target) {
+                let new_target = if target == func.blocks[0].instrs[0].iced.ip() {
+                    target
+                } else {
+                    mapped_target
+                };
+                let mut patched = *original;
+                patched.set_memory_displacement64(new_target);
+                let bytes = super::encode_exact(&patched, decoded.ip(), decoded.len())
+                    .context("interior code address cannot be encoded")?;
+                encoded.code_buffer[off as usize..off as usize + bytes.len()]
+                    .copy_from_slice(&bytes);
+                decoded = Decoder::with_ip(64, &bytes, decoded.ip(), DecoderOptions::NONE).decode();
+                if decoded.ip_rel_memory_address() != new_target {
+                    bail!("interior code-address mismatch");
+                }
+                decoded.set_memory_displacement64(target);
+            }
         }
         consumed += decoded.len();
         spans.push((
@@ -185,6 +206,11 @@ fn import_tail(ins: &Instruction, pe: &PeLayout) -> bool {
             .and_then(|r| u32::try_from(r).ok())
             .is_some_and(|r| pe.import_slots.contains(&r))
 }
+fn layout_interior(pe: &PeLayout, rva: u32) -> bool {
+    pe.runtime_functions
+        .iter()
+        .any(|f| f.start < rva && rva < f.end)
+}
 
 fn eligible(
     analysis: &Analysis,
@@ -207,17 +233,18 @@ fn eligible(
         chain = primary;
     }
     let plain_chain = chain.rva % 4 == 0
+        && info.v2.is_none()
         && matches!(info.kind, crate::pe::UnwindKind::Chained { .. })
         && matches!(chain.kind, crate::pe::UnwindKind::Plain);
     if info.rva % 4 != 0
         || (!info.permits_register_reordering
             && !pe.c_specific.contains_key(&f.start_rva)
+            && !pe.cpp_eh.contains_key(&f.start_rva)
+            && !pe.gs_handlers.contains_key(&f.start_rva)
+            && !(info.v2.is_some() && matches!(info.kind, crate::pe::UnwindKind::Plain))
             && !plain_chain)
     {
         return Err("unsupported unwind metadata");
-    }
-    if pe.c_specific.contains_key(&f.start_rva) && pe.guarded_eh_continuations {
-        return Err("guarded exception continuations");
     }
     if f.end_rva != extent.end {
         return Err("incomplete decoding");
@@ -231,10 +258,23 @@ fn eligible(
     if f.blocks[0].end_rva < info.prologue_end {
         return Err("split prologue");
     }
-    if analysis.range_externally_referenced(index, f.start_rva + 1..f.end_rva) {
+    if analysis.range_unrewritable_reference(index, f.start_rva + 1..f.end_rva) {
         return Err("interior code reference");
     }
     let boundaries: BTreeSet<_> = f.blocks.iter().map(|b| b.start_rva).collect();
+    if f.resolved_indirect
+        .values()
+        .any(|t| !boundaries.contains(t))
+    {
+        return Err("indirect target outside local blocks");
+    }
+    if pe
+        .eh_continuations
+        .range(f.start_rva..f.end_rva)
+        .any(|pc| !boundaries.contains(pc))
+    {
+        return Err("guarded continuation inside instruction");
+    }
     if let Some(scopes) = pe.c_specific.get(&f.start_rva) {
         let starts: BTreeSet<_> = f
             .blocks
@@ -251,6 +291,25 @@ fn eligible(
             return Err("scope boundary inside instruction");
         }
     }
+    if let Some(cpp) = pe.cpp_eh.get(&f.start_rva) {
+        let starts: BTreeSet<_> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .map(|i| i.rva)
+            .chain(std::iter::once(f.end_rva))
+            .collect();
+        if cpp
+            .states
+            .iter()
+            .map(|s| s.0)
+            .chain(cpp.continuations.iter().copied())
+            .filter(|r| f.start_rva <= *r && *r <= f.end_rva)
+            .any(|r| !starts.contains(&r))
+        {
+            return Err("C++ EH boundary inside instruction");
+        }
+    }
     let mut factory = InstructionInfoFactory::new();
     for b in &f.blocks {
         for (i, ins) in b.instrs.iter().enumerate() {
@@ -258,6 +317,8 @@ fn eligible(
                 return Err("pinned or unreachable instructions");
             }
             if !import_tail(&ins.iced, pe)
+                && !f.resolved_indirect.contains_key(&ins.rva)
+                && !f.jump_tables.iter().any(|t| t.branch == ins.rva)
                 && !matches!(
                     ins.iced.flow_control(),
                     FlowControl::Next
@@ -285,7 +346,10 @@ fn eligible(
             }
             if ins.iced.is_ip_rel_memory_operand() {
                 let target = ins.iced.ip_rel_memory_address();
-                if target >= pe.va(f.start_rva) && target < pe.va(f.end_rva) {
+                if target >= pe.va(f.start_rva)
+                    && target < pe.va(f.end_rva)
+                    && ins.iced.mnemonic() != Mnemonic::Lea
+                {
                     return Err("self-referencing code memory");
                 }
             }
@@ -356,9 +420,21 @@ pub fn run_with_segments(
     if (probability == 0.0 && segments.is_none()) || pe.layout().runtime_functions.is_empty() {
         return Ok(c);
     }
-    let plan = SectionPlan::new(pe)?;
+    let plan = SectionPlan::new_with_address_rewrites(
+        pe,
+        analysis
+            .address_references
+            .keys()
+            .any(|r| layout_interior(pe.layout(), *r))
+            || analysis.functions.iter().any(|f| !f.jump_tables.is_empty()),
+    )?;
     let layout = pe.layout();
-    let mut address_taken = layout.relocated_code_references(&pe.data);
+    let table_bytes: Vec<_> = analysis
+        .functions
+        .iter()
+        .flat_map(|f| f.jump_tables.iter().map(|t| t.bytes.clone()))
+        .collect();
+    let mut address_taken = layout.relocated_code_references_except(&pe.data, &table_bytes);
     address_taken.extend(layout.code_roots.iter().copied());
     address_taken.extend(
         analysis
@@ -367,6 +443,7 @@ pub fn run_with_segments(
             .flat_map(|f| &f.blocks)
             .flat_map(|b| &b.instrs)
             .filter(|i| i.iced.is_ip_rel_memory_operand())
+            .filter(|i| i.iced.mnemonic() != Mnemonic::Lea)
             .filter_map(|i| {
                 i.iced
                     .ip_rel_memory_address()
@@ -378,6 +455,8 @@ pub fn run_with_segments(
     let mut entries = Vec::new();
     let mut generated_unwind = BTreeSet::new();
     let mut patches = Vec::new();
+    let mut continuation_updates = BTreeMap::new();
+    let mut global_map = BTreeMap::new();
     for (index, f) in analysis.functions.iter().enumerate() {
         let eligibility = eligible(analysis, layout, f, index, segments.is_some()).and_then(|()| {
             if address_taken
@@ -464,6 +543,25 @@ pub fn run_with_segments(
                 .context("unwind offset overflow")?,
             4,
         )?;
+        let old_unwind = layout.rva_to_offset(info.rva).context("unmapped unwind")?;
+        let codes_end = 4 + (pe.data[old_unwind + 2] as usize).div_ceil(2) * 4;
+        let prefix = if let Some(v2) = &info.v2 {
+            let Ok(prefix) = v2.relocate(
+                layout.image_base,
+                &encoded.address_map,
+                end,
+                &pe.data[f.off..f.off + (f.end_rva - f.start_rva) as usize],
+                f.start_rva,
+                &encoded.code,
+                rva,
+            ) else {
+                c.reverted += 1;
+                continue;
+            };
+            prefix
+        } else {
+            pe.data[old_unwind..old_unwind + codes_end].to_vec()
+        };
         if let Some(scopes) = layout.c_specific.get(&f.start_rva) {
             let Ok(relocated) = crate::exception::relocate(
                 scopes,
@@ -474,11 +572,7 @@ pub fn run_with_segments(
                 c.reverted += 1;
                 continue;
             };
-            let old_unwind = layout
-                .rva_to_offset(info.rva)
-                .context("unmapped original unwind")?;
-            let codes_end = 4 + (pe.data[old_unwind + 2] as usize).div_ceil(2) * 4;
-            exception_bytes.extend_from_slice(&pe.data[old_unwind..old_unwind + codes_end]);
+            exception_bytes.extend_from_slice(&prefix);
             exception_bytes.extend_from_slice(&scopes.handler.to_le_bytes());
             exception_bytes.extend_from_slice(&u32::try_from(relocated.len())?.to_le_bytes());
             for scope in relocated {
@@ -486,15 +580,66 @@ pub fn run_with_segments(
                     exception_bytes.extend_from_slice(&value.to_le_bytes());
                 }
             }
+            exception_bytes.extend_from_slice(&scopes.gs_data);
             unwind_rva = plan
                 .rva
                 .checked_add(unwind_offset)
                 .context("new unwind RVA overflow")?;
         }
+        if let Some(cpp) = layout.cpp_eh.get(&f.start_rva) {
+            let new_unwind = plan
+                .rva
+                .checked_add(unwind_offset)
+                .context("C++ unwind RVA overflow")?;
+            let data_rva = new_unwind
+                .checked_add(u32::try_from(prefix.len() + 4)?)
+                .context("C++ data RVA overflow")?;
+            let Ok(language) = cpp.relocate(
+                layout.image_base,
+                data_rva,
+                rva,
+                &encoded.address_map,
+                &encoded.spans,
+            ) else {
+                c.reverted += 1;
+                continue;
+            };
+            exception_bytes.extend_from_slice(&prefix);
+            exception_bytes.extend_from_slice(&cpp.handler.to_le_bytes());
+            exception_bytes.extend_from_slice(&language);
+            unwind_rva = new_unwind;
+        }
+        if info.v2.is_some() && exception_bytes.is_empty() {
+            exception_bytes = prefix.clone();
+            unwind_rva = plan
+                .rva
+                .checked_add(unwind_offset)
+                .context("v2 unwind RVA overflow")?;
+        }
+        if let Some(gs) = layout.gs_handlers.get(&f.start_rva) {
+            let crate::pe::UnwindKind::Handler { handler_rva, .. } = info.kind else {
+                bail!("GS data without handler");
+            };
+            exception_bytes = prefix;
+            exception_bytes.extend_from_slice(&handler_rva.to_le_bytes());
+            exception_bytes.extend_from_slice(gs);
+            unwind_rva = plan
+                .rva
+                .checked_add(unwind_offset)
+                .context("GS unwind RVA overflow")?;
+        }
         if !exception_bytes.is_empty() {
             generated_unwind.insert(unwind_rva);
         }
         patches.push((f.off, jump));
+        global_map.extend(encoded.address_map.iter().map(|(&a, &b)| (a, b)));
+        for &old in layout.eh_continuations.range(f.start_rva..f.end_rva) {
+            let target = encoded
+                .address_map
+                .get(&layout.va(old))
+                .context("missing guarded continuation mapping")?;
+            continuation_updates.insert(old, u32::try_from(target - layout.image_base)?);
+        }
         entries.push((rva, end, unwind_rva));
         payload.resize(offset as usize, 0xCC);
         payload.extend_from_slice(&encoded.code);
@@ -504,6 +649,10 @@ pub fn run_with_segments(
         }
         c.applied += 1;
         c.relocated_c_specific += u64::from(layout.c_specific.contains_key(&f.start_rva));
+        if let Some(cpp) = layout.cpp_eh.get(&f.start_rva) {
+            c.relocated_fh3 += u64::from(!cpp.is_fh4());
+            c.relocated_fh4 += u64::from(cpp.is_fh4());
+        }
         c.relocated_chained +=
             u64::from(matches!(info.kind, crate::pe::UnwindKind::Chained { .. }));
         c.relocated_import_tails += u64::from(
@@ -515,7 +664,99 @@ pub fn run_with_segments(
         c.instructions_touched += f.instr_count as u64;
     }
     if !entries.is_empty() {
-        plan.commit(pe, payload, &entries, &patches, &generated_unwind)?;
+        let mut metadata_patches = Vec::new();
+        for table in analysis.functions.iter().flat_map(|f| &f.jump_tables) {
+            metadata_patches.push((
+                table.bytes.start,
+                table.rewrite(layout.image_base, &global_map)?,
+            ));
+        }
+        for (&old_target, sources) in &analysis.address_references {
+            // Preserve function-pointer identity and existing CFG entry tables.
+            // The stable entry trampoline already reaches the relocated body.
+            if layout
+                .runtime_functions
+                .iter()
+                .any(|f| f.start == old_target)
+            {
+                continue;
+            }
+            let Some(&new_target) = global_map.get(&layout.va(old_target)) else {
+                continue;
+            };
+            for source in sources {
+                let mut patched = source.iced;
+                patched.set_memory_displacement64(new_target);
+                let original = super::encode_exact(&patched, source.iced.ip(), source.len)
+                    .context("cannot rewrite original interior code address")?;
+                if !patches.iter().any(|(at, bytes)| {
+                    *at < source.off + source.len && source.off < at + bytes.len()
+                }) {
+                    metadata_patches.push((source.off, original));
+                }
+                if let Some(&new_source) = global_map.get(&source.iced.ip()) {
+                    let at = usize::try_from(new_source - layout.va(plan.rva))?;
+                    let actual =
+                        Decoder::with_ip(64, &payload[at..], new_source, DecoderOptions::NONE)
+                            .decode();
+                    let bytes = super::encode_exact(&patched, new_source, actual.len())
+                        .context("cannot rewrite relocated interior code address")?;
+                    let decoded =
+                        Decoder::with_ip(64, &bytes, new_source, DecoderOptions::NONE).decode();
+                    if decoded.is_invalid() || decoded.ip_rel_memory_address() != new_target {
+                        bail!("invalid interior code-address fixup");
+                    }
+                    payload[at..at + bytes.len()].copy_from_slice(&bytes);
+                }
+            }
+        }
+        if let Some(table) = &layout.eh_continuation_table {
+            let mut targets: Vec<_> = layout
+                .eh_continuations
+                .iter()
+                .map(|r| continuation_updates.get(r).copied().unwrap_or(*r))
+                .collect();
+            if plan.retains_original_bodies() {
+                targets.extend(layout.eh_continuations.iter().copied());
+            }
+            targets.sort_unstable();
+            targets.dedup();
+            let bytes: Vec<u8> = targets.iter().flat_map(|r| r.to_le_bytes()).collect();
+            if targets.len() > layout.eh_continuations.len() {
+                let (pointer, count) = layout
+                    .eh_continuation_fields
+                    .context("missing guard EH table fields")?;
+                let pe_header =
+                    u32::from_le_bytes(pe.data[0x3C..0x40].try_into().unwrap()) as usize;
+                let dynamic_base = u16::from_le_bytes(
+                    pe.data[pe_header + 24 + 70..pe_header + 24 + 72]
+                        .try_into()
+                        .unwrap(),
+                ) & 0x40
+                    != 0;
+                if dynamic_base && !layout.is_protected(pointer..pointer + 8) {
+                    bail!("guard EH table pointer lacks an ASLR relocation");
+                }
+                payload.resize(align(u32::try_from(payload.len())?, 4)? as usize, 0);
+                let va = layout.va(plan
+                    .rva
+                    .checked_add(u32::try_from(payload.len())?)
+                    .context("guard EH payload overflow")?);
+                metadata_patches.push((pointer, va.to_le_bytes().to_vec()));
+                metadata_patches.push((count, (targets.len() as u64).to_le_bytes().to_vec()));
+                payload.extend(bytes);
+            } else {
+                metadata_patches.push((table.start, bytes));
+            }
+        }
+        plan.commit_with_metadata(
+            pe,
+            payload,
+            &entries,
+            &patches,
+            &generated_unwind,
+            &metadata_patches,
+        )?;
     }
     Ok(c)
 }

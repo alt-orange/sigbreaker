@@ -67,9 +67,16 @@ fn put(data: &mut [u8], at: usize, value: u32) {
 pub struct SectionPlan {
     pub rva: u32,
     opt: usize,
+    append_section: bool,
 }
 impl SectionPlan {
+    pub fn retains_original_bodies(&self) -> bool {
+        self.append_section
+    }
     pub fn new(pe: &PeFile) -> Result<Self> {
+        Self::new_with_address_rewrites(pe, false)
+    }
+    pub fn new_with_address_rewrites(pe: &PeFile, force_append: bool) -> Result<Self> {
         let opt = u32_at(&pe.data, 0x3C)? as usize + 24;
         let text = pe
             .layout()
@@ -77,12 +84,40 @@ impl SectionPlan {
             .iter()
             .find(|s| s.name() == ".text" && s.is_executable())
             .context("output rebuild requires .text")?;
-        Ok(Self {
-            rva: text
-                .virtual_address
+        // Opaque language metadata cannot be rebased when .text pushes data
+        // sections to new RVAs. Append a section instead, preserving every
+        // existing RVA and retaining bodies whose reference closure is unknown.
+        let append_section = pe.layout().runtime_functions.iter().any(|f| {
+            pe.layout().unwind_info(f.start).is_some_and(|info| {
+                matches!(info.kind, crate::pe::UnwindKind::Unsupported { .. })
+                    || (matches!(info.kind, crate::pe::UnwindKind::Handler { .. })
+                        && !pe.layout().c_specific.contains_key(&f.start))
+            })
+        }) || pe.layout().executable_sections().count() != 1
+            || !pe.layout().handler_symbols.is_empty()
+            || force_append;
+        let rva = if append_section {
+            align(
+                pe.layout().sections.iter().try_fold(0u32, |end, s| {
+                    Ok::<_, anyhow::Error>(
+                        end.max(
+                            s.virtual_address
+                                .checked_add(s.virtual_size.max(s.raw_size))
+                                .context("section RVA overflow")?,
+                        ),
+                    )
+                })?,
+                u32_at(&pe.data, opt + 32)?,
+            )?
+        } else {
+            text.virtual_address
                 .checked_add(text.raw_size)
-                .context(".text append RVA overflow")?,
+                .context(".text append RVA overflow")?
+        };
+        Ok(Self {
+            rva,
             opt,
+            append_section,
         })
     }
     /// Rebuild the existing .text section, moving later raw data and rebasing
@@ -90,11 +125,25 @@ impl SectionPlan {
     pub fn commit(
         self,
         pe: &mut PeFile,
-        mut code: Vec<u8>,
+        code: Vec<u8>,
         entries: &[(u32, u32, u32)],
         patches: &[(usize, Vec<u8>)],
         generated_unwind: &std::collections::BTreeSet<u32>,
     ) -> Result<()> {
+        self.commit_with_metadata(pe, code, entries, patches, generated_unwind, &[])
+    }
+    pub fn commit_with_metadata(
+        self,
+        pe: &mut PeFile,
+        mut code: Vec<u8>,
+        entries: &[(u32, u32, u32)],
+        patches: &[(usize, Vec<u8>)],
+        generated_unwind: &std::collections::BTreeSet<u32>,
+        metadata_patches: &[(usize, Vec<u8>)],
+    ) -> Result<()> {
+        if self.append_section {
+            return self.commit_section(pe, code, entries, patches, metadata_patches);
+        }
         let text = *pe
             .layout()
             .sections
@@ -213,6 +262,13 @@ impl SectionPlan {
         }
         output[insert..insert + code.len()].copy_from_slice(&code);
         layout.apply(&mut output)?;
+        for (at, bytes) in metadata_patches {
+            let dest = layout.raw(*at)?;
+            output
+                .get_mut(dest..dest + bytes.len())
+                .context("metadata patch outside file")?
+                .copy_from_slice(bytes);
+        }
         let original_table_rva = u32_at(&pe.data, self.opt + 112 + 3 * 8)?;
         let original_table_size = u32_at(&pe.data, self.opt + 116 + 3 * 8)? as usize;
         let original_table = pe
@@ -276,7 +332,7 @@ impl SectionPlan {
             self.opt + 116 + 3 * 8,
             u32::try_from(table_count * 12)?,
         );
-        let rebuilt = PeFile::parse(output)?;
+        let rebuilt = PeFile::parse_with_symbols(output, pe.layout().handler_symbols.clone())?;
         if rebuilt.layout().sections.len() != pe.layout().sections.len()
             || rebuilt
                 .layout()
@@ -288,6 +344,230 @@ impl SectionPlan {
             bail!(".text rebuild changed the original section set");
         }
         *pe = rebuilt;
+        Ok(())
+    }
+
+    /// Preserve all existing virtual addresses, including unclassified language
+    /// data. Only documented raw-file offsets change when headers/overlay move.
+    fn commit_section(
+        self,
+        pe: &mut PeFile,
+        mut code: Vec<u8>,
+        entries: &[(u32, u32, u32)],
+        patches: &[(usize, Vec<u8>)],
+        metadata_patches: &[(usize, Vec<u8>)],
+    ) -> Result<()> {
+        let count = pe.layout().sections.len();
+        let new_count = u16::try_from(count + 1).context("too many PE sections")?;
+        let table =
+            self.opt + u16::from_le_bytes(pe.data[self.opt - 4..self.opt - 2].try_into()?) as usize;
+        let slot = table
+            .checked_add(count.checked_mul(40).context("section table overflow")?)
+            .context("section table overflow")?;
+        let file_align = u32_at(&pe.data, self.opt + 36)?;
+        let section_align = u32_at(&pe.data, self.opt + 32)?;
+        if section_align < 4096 || file_align > section_align {
+            bail!("unsupported low-alignment appended section");
+        }
+        let old_headers = u32_at(&pe.data, self.opt + 60)? as usize;
+        let first_raw = pe
+            .layout()
+            .sections
+            .iter()
+            .filter(|s| s.raw_size != 0)
+            .map(|s| s.raw_ptr as usize)
+            .min()
+            .context("no file-backed sections")?;
+        let free_slot = slot + 40 <= old_headers.min(first_raw)
+            && pe
+                .data
+                .get(slot..slot + 40)
+                .is_some_and(|b| b.iter().all(|&v| v == 0));
+        let header_growth = if free_slot {
+            0
+        } else {
+            align(40, file_align)? as usize
+        };
+        if old_headers > first_raw || slot > old_headers {
+            bail!("section table exceeds file-backed PE headers");
+        }
+        let insert = pe
+            .layout()
+            .sections
+            .iter()
+            .filter(|s| s.raw_size != 0)
+            .try_fold(old_headers, |end, s| {
+                Ok::<_, anyhow::Error>(
+                    end.max(
+                        (s.raw_ptr as usize)
+                            .checked_add(s.raw_size as usize)
+                            .context("raw section overflow")?,
+                    ),
+                )
+            })?;
+        let raw = align(
+            u32::try_from(
+                insert
+                    .checked_add(header_growth)
+                    .context("raw offset overflow")?,
+            )?,
+            file_align,
+        )? as usize;
+        code.resize(align(u32::try_from(code.len())?, 4)? as usize, 0);
+        let table_offset = code.len();
+        let mut runtime = pe
+            .layout()
+            .runtime_functions
+            .iter()
+            .map(|f| {
+                (
+                    f.start,
+                    f.end,
+                    pe.layout().unwind_info(f.start).unwrap().rva,
+                )
+            })
+            .chain(entries.iter().copied())
+            .collect::<Vec<_>>();
+        runtime.sort_unstable_by_key(|r| r.0);
+        if runtime.windows(2).any(|w| w[0].1 > w[1].0) {
+            bail!("overlapping appended runtime entries");
+        }
+        for &(begin, end, unwind) in &runtime {
+            for value in [begin, end, unwind] {
+                code.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let virtual_size = u32::try_from(code.len())?;
+        let raw_size = align(virtual_size, file_align)? as usize;
+        let insertion_size = raw
+            .checked_sub(insert + header_growth)
+            .context("append alignment underflow")?
+            .checked_add(raw_size)
+            .context("append size overflow")?;
+        let map_raw = |old: usize| -> Result<usize> {
+            old.checked_add(if old >= slot { header_growth } else { 0 })
+                .and_then(|v| v.checked_add(if old >= insert { insertion_size } else { 0 }))
+                .context("raw offset overflow")
+        };
+        let mut output = Vec::new();
+        output.extend_from_slice(&pe.data[..slot]);
+        output.resize(slot + header_growth, 0);
+        output.extend_from_slice(&pe.data[slot..insert]);
+        output.resize(raw, 0);
+        output.extend_from_slice(&code);
+        output.resize(raw + raw_size, 0);
+        output.extend_from_slice(&pe.data[insert..]);
+        let raw_field = |output: &mut [u8], field: usize| -> Result<()> {
+            let old = u32_at(&pe.data, field)?;
+            if old != 0 {
+                put(
+                    output,
+                    map_raw(field)?,
+                    u32::try_from(map_raw(old as usize)?)?,
+                );
+            }
+            Ok(())
+        };
+        raw_field(&mut output, self.opt - 12)?;
+        for i in 0..count {
+            for off in [20, 24, 28] {
+                raw_field(&mut output, table + i * 40 + off)?;
+            }
+        }
+        let dirs = u32_at(&pe.data, self.opt + 108)? as usize;
+        if dirs > 4 {
+            raw_field(&mut output, self.opt + 112 + 4 * 8)?;
+        }
+        if dirs > 6 {
+            let debug_rva = u32_at(&pe.data, self.opt + 112 + 6 * 8)?;
+            let debug_size = u32_at(&pe.data, self.opt + 116 + 6 * 8)? as usize;
+            if debug_rva != 0 {
+                if !debug_size.is_multiple_of(28) {
+                    bail!("malformed debug directory");
+                }
+                let debug = pe
+                    .layout()
+                    .rva_to_offset(debug_rva)
+                    .context("unmapped debug directory")?;
+                for off in (0..debug_size).step_by(28) {
+                    raw_field(&mut output, debug + off + 24)?;
+                }
+            }
+        }
+        let mut name = [0u8; 8];
+        let suffix = (0..)
+            .map(|i| {
+                if i == 0 {
+                    ".sbrk".to_owned()
+                } else {
+                    format!(".sbrk{i}")
+                }
+            })
+            .find(|n| !pe.layout().sections.iter().any(|s| s.name() == n))
+            .unwrap();
+        if suffix.len() > 8 {
+            bail!("no available section name");
+        }
+        name[..suffix.len()].copy_from_slice(suffix.as_bytes());
+        output[slot..slot + 40].fill(0);
+        output[slot..slot + 8].copy_from_slice(&name);
+        for (off, value) in [
+            (8, virtual_size),
+            (12, self.rva),
+            (16, u32::try_from(raw_size)?),
+            (20, u32::try_from(raw)?),
+            (36, 0x60000020),
+        ] {
+            put(&mut output, slot + off, value);
+        }
+        output[self.opt - 18..self.opt - 16].copy_from_slice(&new_count.to_le_bytes());
+        put(
+            &mut output,
+            self.opt + 60,
+            u32::try_from(old_headers + header_growth)?,
+        );
+        put(
+            &mut output,
+            self.opt + 56,
+            align(
+                self.rva
+                    .checked_add(virtual_size)
+                    .context("image size overflow")?,
+                section_align,
+            )?,
+        );
+        put(
+            &mut output,
+            self.opt + 4,
+            u32_at(&pe.data, self.opt + 4)?
+                .checked_add(u32::try_from(raw_size)?)
+                .context("code size overflow")?,
+        );
+        put(
+            &mut output,
+            self.opt + 112 + 3 * 8,
+            self.rva
+                .checked_add(u32::try_from(table_offset)?)
+                .context("runtime table overflow")?,
+        );
+        put(
+            &mut output,
+            self.opt + 116 + 3 * 8,
+            u32::try_from(
+                runtime
+                    .len()
+                    .checked_mul(12)
+                    .context("runtime table overflow")?,
+            )?,
+        );
+        for (off, bytes) in patches.iter().chain(metadata_patches) {
+            let dest = map_raw(*off)?;
+            output
+                .get_mut(dest..dest + bytes.len())
+                .context("entry patch outside file")?
+                .copy_from_slice(bytes);
+        }
+        *pe = PeFile::parse_with_symbols(output, pe.layout().handler_symbols.clone())?;
         Ok(())
     }
 }

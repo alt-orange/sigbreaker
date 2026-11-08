@@ -19,6 +19,7 @@ pub struct CSpecific {
     pub handler: u32,
     pub scopes: Vec<Scope>,
     pub table_bytes: Range<usize>,
+    pub gs_data: Vec<u8>,
 }
 
 fn bytes<'a>(pe: &PeLayout, data: &'a [u8], rva: u32, size: usize) -> Result<&'a [u8]> {
@@ -123,54 +124,58 @@ pub fn is_c_specific(
     imports: &BTreeMap<u32, (String, String)>,
     handler: u32,
 ) -> bool {
+    handler_name(pe, data, imports, handler).as_deref() == Some("__C_specific_handler")
+}
+
+pub fn handler_name(
+    pe: &PeLayout,
+    data: &[u8],
+    imports: &BTreeMap<u32, (String, String)>,
+    handler: u32,
+) -> Option<String> {
     let mut rva = handler;
     let mut seen = BTreeSet::new();
     for _ in 0..8 {
         if !seen.insert(rva) {
-            return false;
+            return None;
         }
-        let Some(off) = pe.rva_to_offset(rva) else {
-            return false;
-        };
-        let Some(raw) = data.get(off..off.saturating_add(15).min(data.len())) else {
-            return false;
-        };
+        let off = pe.rva_to_offset(rva)?;
+        let raw = data.get(off..off.saturating_add(15).min(data.len()))?;
         let ins = Decoder::with_ip(64, raw, pe.va(rva), DecoderOptions::NONE).decode();
         if ins.is_invalid()
             || pe.rva_to_offset(rva.saturating_add(ins.len() as u32 - 1))
                 != Some(off + ins.len() - 1)
         {
-            return false;
+            return None;
         }
         if ins.is_jmp_near_indirect() && ins.is_ip_rel_memory_operand() {
-            let Some(slot) = ins
+            let slot = ins
                 .ip_rel_memory_address()
                 .checked_sub(pe.image_base)
-                .and_then(|v| u32::try_from(v).ok())
-            else {
-                return false;
-            };
-            return imports.get(&slot).is_some_and(|(library, name)| {
-                name == "__C_specific_handler"
-                    && matches!(
-                        library.as_str(),
-                        "vcruntime140.dll" | "vcruntime140d.dll" | "ntdll.dll" | "msvcrt.dll"
-                    )
+                .and_then(|v| u32::try_from(v).ok())?;
+            return imports.get(&slot).and_then(|(library, name)| {
+                matches!(
+                    library.as_str(),
+                    "vcruntime140.dll"
+                        | "vcruntime140d.dll"
+                        | "vcruntime140_1.dll"
+                        | "vcruntime140_1d.dll"
+                        | "ntdll.dll"
+                        | "msvcrt.dll"
+                )
+                .then(|| name.clone())
             });
         }
         if !ins.is_jmp_short_or_near() {
-            return false;
+            return None;
         }
-        let Some(next) = ins
+        let next = ins
             .near_branch_target()
             .checked_sub(pe.image_base)
-            .and_then(|v| u32::try_from(v).ok())
-        else {
-            return false;
-        };
+            .and_then(|v| u32::try_from(v).ok())?;
         rva = next;
     }
-    false
+    None
 }
 
 pub fn parse(
@@ -224,7 +229,56 @@ pub fn parse(
         handler,
         scopes,
         table_bytes: off..off + size,
+        gs_data: Vec::new(),
     })
+}
+
+/// GS cookie offsets are frame-relative, so an unchanged prologue/frame allows
+/// byte-exact copying. Bit 2 adds aligned-base offset and alignment mask words.
+pub fn gs_data(pe: &PeLayout, data: &[u8], rva: u32) -> Result<Vec<u8>> {
+    let flags = word(pe, data, rva)?;
+    Ok(bytes(pe, data, rva, if flags & 4 != 0 { 12 } else { 4 })?.to_vec())
+}
+
+/// Explicit linker-map identities allow statically linked handlers to be used
+/// without guessing an ABI from machine-code prefixes or unversioned metadata.
+pub fn map_symbols(text: &str, image_base: u64) -> Result<BTreeMap<u32, String>> {
+    let mut result = BTreeMap::new();
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 3 || !fields[0].contains(':') {
+            continue;
+        }
+        let name = fields[1];
+        if !matches!(
+            name,
+            "__C_specific_handler"
+                | "__CxxFrameHandler3"
+                | "__CxxFrameHandler4"
+                | "__GSHandlerCheck"
+                | "__GSHandlerCheck_SEH"
+                | "__GSHandlerCheck_EH"
+                | "__GSHandlerCheck_EH4"
+        ) {
+            continue;
+        }
+        let va =
+            u64::from_str_radix(fields[2], 16).context("invalid linker-map handler address")?;
+        let rva = u32::try_from(
+            va.checked_sub(image_base)
+                .context("linker map uses a different image base")?,
+        )?;
+        if result
+            .insert(rva, name.to_owned())
+            .is_some_and(|old| old != name)
+        {
+            bail!("conflicting linker-map handler symbols");
+        }
+    }
+    if result.is_empty() {
+        bail!("linker map contains no supported handler identities");
+    }
+    Ok(result)
 }
 
 /// Relocate each scope's coverage, splitting discontiguous ranges while keeping
