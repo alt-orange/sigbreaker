@@ -27,18 +27,37 @@ for name, original in result['targets'].items():
     lines.append(f"| {name} | {sum(row['status'] == 'passed' for row in rows)}/{len(rows)} | "
                  f"{sum(bool(c.get('matches_original')) for c in cases)}/{len(cases)} | {growth_label} |")
 lines += ['', '## Modes and coverage', '',
-          'Modes: control, segment only, reorder only, shuffle only, and all passes. '
+          'Modes: control, segment only, reorder only, shuffle only, all passes, and expanding segment injection. '
           'Active modes use seeds 1397311314, 7, and 42; the control uses one seed.', '',
           'Rust cases cover arithmetic, sorting, recursion/iteration, caught panic, and errors. '
           'ripgrep cases cover literal/regex, Unicode, multiline, recursive search, no matches, and invalid syntax. '
           'MSVC EXE/DLL cases cover callbacks, switch dispatch, nested exceptions/destructors, sorting, threads, '
-          'stack walking, and errors. DLLs load in fresh Python processes through their exported entry.', '']
+          'stack walking, and errors. DLLs load in fresh Python processes through their exported entry. '
+          'The native SEH/assembly fixture focuses on control, shuffle, combined, and growing-prefix modes; '
+          'it tests raised exceptions, access violations, nested finally/filter scopes, chained unwind, '
+          'and import tail jumps. Individual prefix/scheduler modes are exercised on the other targets.', '']
 for name, covered in result.get('relocated_stackwalk_coverage', {}).items():
     rows = [row for row in variants if row['target'] == name and row.get('relocated_stackwalk')]
     lines.append(f'- {name}: relocated stack-walk coverage = {covered}; {len(rows)} variants have '
                  'an exported walk entry jumping into `.sbrk`, a corresponding runtime-function entry, '
                  'and runtime results in `results.json`.')
 benchmark_file = directory / 'benchmark.json'
+stress_file = directory / 'exception-layouts.json'
+if stress_file.exists():
+    stressed = json.loads(stress_file.read_text(encoding='utf-8'))
+    lines += ['', '## Exception layout stress checks', '',
+              f"{sum(bool(c['passed']) for c in stressed)}/{len(stressed)} cases passed with both shuffled "
+              'and growing-prefix layouts over additional seeds. Each layout requires actual SEH/chained/'
+              'import-tail relocation, rewritten SEH unwind records, and a fixed chained primary.']
+for export, covered in result.get('relocated_exception_coverage', {}).items():
+    lines.append(f'- {export}: verified relocation and matching native exception/stack/tail behavior = {covered}.')
+reprocess_file = directory / 'reprocess.json'
+if reprocess_file.exists():
+    reprocessed = json.loads(reprocess_file.read_text(encoding='utf-8'))
+    lines += ['', '## Reprocessing', '',
+              f"{sum(bool(c['passed']) for c in reprocessed)}/{len(reprocessed)} repeated-processing runtime cases passed. "
+              'Each target was transformed three further times. `reprocess.json` retains the checks; '
+              'per-pass logs retain transformation reports.']
 if benchmark_file.exists():
     benchmark = json.loads(benchmark_file.read_text(encoding='utf-8'))
     lines += ['', '## Repeated paired benchmark', '',
@@ -57,9 +76,10 @@ for name, original in result['targets'].items():
 lines += ['', '## Evidence and limits', '',
           '`results.json` retains per-case output bytes, exit codes, timing, transform logs, and output hashes. '
           '`benchmark.json` retains every measured sample. Original hashes are checked after the runtime matrix.', '',
-          'This finite test matrix does not prove arbitrary-binary equivalence. Handler-bearing/chained/newer '
-          'unwind functions and unresolved control flow remain outside relocation support. Passing exception '
-          'tests does not mean language-specific exception tables were rewritten.', '']
+          'This finite test matrix does not prove arbitrary-binary equivalence. Recognized C-specific SEH '
+          'scope tables are rewritten. Supported secondary chains reuse their unchanged records and pinned '
+          'primary. C++ FH3/FH4, unknown handlers, newer unwind formats, and general indirect dispatch '
+          'remain unsupported.', '']
 output = directory / 'REPORT.md'
 output.write_text('\n'.join(lines), encoding='utf-8')
 print(output)

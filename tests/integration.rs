@@ -141,6 +141,99 @@ fn same_seed_same_output() {
 }
 
 #[test]
+fn report_counts_changed_functions_and_excludes_checksum_only_edits() {
+    let mut code = vec![0x90; 16];
+    code[..6].copy_from_slice(&[0xE8, 11, 0, 0, 0, 0xC3]);
+    code.extend_from_slice(&[0x8B, 0x40, 0, 0xC3]);
+    let exe = TempExe::write(&TestPe::new().with_code(&code).data);
+    let report = pipeline::run(&exe.cli(&[
+        "--seg-prob",
+        "1",
+        "--segments",
+        "ds",
+        "--no-reorder",
+        "--no-shuffle",
+    ]))
+    .unwrap();
+    assert!(
+        report.contains("transformed: 1/2 functions (50.00%)"),
+        "{report}"
+    );
+    let control =
+        pipeline::run(&exe.cli(&["--no-seg-inject", "--no-reorder", "--no-shuffle"])).unwrap();
+    assert!(
+        control.contains("transformed: 0/2 functions (0.00%)"),
+        "{control}"
+    );
+}
+
+#[test]
+fn defaults_enable_full_coverage_and_growth_can_be_disabled() {
+    let mut pe = TestPe::new().with_code(&[0x8B, 0x02, 0x01, 0xC0, 0xC3]);
+    for (at, value) in [
+        (0xE0, 0x2040u32),
+        (0xE4, 12),
+        (0x840, 0x1000),
+        (0x844, 0x1005),
+        (0x848, 0x2080),
+    ] {
+        pe.data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    pe.data[0x880] = 1;
+    let exe = TempExe::write(&pe.data);
+    let defaults = exe.cli(&[]);
+    assert_eq!(
+        (
+            defaults.seg_prob,
+            defaults.reorder_prob,
+            defaults.shuffle_prob
+        ),
+        (1.0, 1.0, 1.0)
+    );
+    let report = pipeline::run(&defaults).unwrap();
+    let default_bytes = std::fs::read(out_path(&exe.path)).unwrap();
+    assert!(default_bytes.len() > pe.data.len());
+    assert_eq!(default_bytes[0x400], 0xE9);
+    assert!(report.contains("transformed: 1/1 functions (100.00%)"));
+    pipeline::run(&exe.cli(&[
+        "--grow-segments",
+        "--seg-prob",
+        "1",
+        "--reorder-prob",
+        "1",
+        "--shuffle-prob",
+        "1",
+    ]))
+    .unwrap();
+    assert_eq!(default_bytes, std::fs::read(out_path(&exe.path)).unwrap());
+    for flags in [
+        vec!["--no-grow-segments"],
+        vec!["--grow-segments", "--no-grow-segments"],
+        vec!["--no-seg-inject"],
+    ] {
+        let mut args = vec!["--no-shuffle", "--no-reorder"];
+        args.extend(flags);
+        let report = pipeline::run(&exe.cli(&args)).unwrap();
+        assert!(
+            report.contains("transformed: 0/1 functions (0.00%)"),
+            "{report}"
+        );
+        assert_eq!(
+            pe.data.len(),
+            std::fs::read(out_path(&exe.path)).unwrap().len()
+        );
+    }
+    let report = pipeline::run(&exe.cli(&[
+        "--no-shuffle",
+        "--no-reorder",
+        "--no-grow-segments",
+        "--grow-segments",
+    ]))
+    .unwrap();
+    assert!(report.contains("transformed: 1/1 functions (100.00%)"));
+}
+
+#[test]
 fn info_mode_writes_nothing() {
     let pe = TestPe::new().with_sample_code();
     let exe = TempExe::write(&pe.data);

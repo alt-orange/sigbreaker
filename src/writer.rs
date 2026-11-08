@@ -1,5 +1,5 @@
 //! Append-only PE section writer. Existing section offsets and overlays stay fixed.
-use crate::pe::PeFile;
+use crate::pe::{PeFile, SectionHeader};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,6 +72,8 @@ pub struct SectionPlan {
     coff: usize,
     section_alignment: u32,
     file_alignment: u32,
+    extend: Option<SectionHeader>,
+    name: [u8; 8],
 }
 
 impl SectionPlan {
@@ -95,17 +97,14 @@ impl SectionPlan {
         let header_limit = (u32_at(&pe.data, opt + 60)? as usize)
             .min(first_raw)
             .min(pe.data.len());
-        if header + 40 > header_limit || pe.data[header..header + 40].iter().any(|&b| b != 0) {
-            bail!("unsupported PE: no unused section-header slot");
-        }
-        if pe.layout().sections.iter().any(|s| s.name() == ".sbrk") {
-            bail!("image already contains a SigBreaker relocation section");
-        }
+        let spare_header =
+            header + 40 <= header_limit && pe.data[header..header + 40].iter().all(|&b| b == 0);
         if optional_size < 144 || u32_at(&pe.data, opt + 108)? < 4 {
             bail!("missing exception data-directory slot");
         }
         let section_alignment = u32_at(&pe.data, opt + 32)?;
         let file_alignment = u32_at(&pe.data, opt + 36)?;
+        align(0, file_alignment)?;
         let end = pe
             .layout()
             .sections
@@ -119,14 +118,66 @@ impl SectionPlan {
                     ),
                 )
             })?;
+        let rva = align(end, section_alignment)?;
+        let mut name = *b".sbrk\0\0\0";
+        for index in 0..96 {
+            let candidate = if index == 0 {
+                ".sbrk".to_owned()
+            } else {
+                format!(".sbrk{index}")
+            };
+            if !pe.layout().sections.iter().any(|s| s.name() == candidate) {
+                name.fill(0);
+                name[..candidate.len()].copy_from_slice(candidate.as_bytes());
+                break;
+            }
+        }
+        let (header, raw, extend) = if spare_header {
+            (
+                header,
+                align(u32::try_from(pe.data.len())?, file_alignment)?,
+                None,
+            )
+        } else {
+            // Extending the final mapped/file-backed section needs no new
+            // header or shifted raw offsets. Refuse overlays and virtual-only
+            // tails, whose bytes could acquire different mapped contents.
+            let (index, last) = pe
+                .layout()
+                .sections
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, s)| s.virtual_address)
+                .context("no sections")?;
+            if last.raw_size < last.virtual_size
+                || last.raw_size == 0
+                || last.raw_ptr as u64 + last.raw_size as u64 != pe.data.len() as u64
+                || last.characteristics & 0x80 != 0
+            {
+                bail!("no section-header room and final section cannot safely grow");
+            }
+            let raw = last
+                .raw_ptr
+                .checked_add(
+                    rva.checked_sub(last.virtual_address)
+                        .context("section RVA order")?,
+                )
+                .context("extended raw overflow")?;
+            if raw % file_alignment != 0 {
+                bail!("extended section raw alignment mismatch");
+            }
+            (opt + optional_size + index * 40, raw, Some(*last))
+        };
         Ok(Self {
-            rva: align(end, section_alignment)?,
-            raw: align(u32::try_from(pe.data.len())?, file_alignment)?,
+            rva,
+            raw,
             header,
             opt,
             coff,
             section_alignment,
             file_alignment,
+            extend,
+            name,
         })
     }
 
@@ -183,14 +234,39 @@ impl SectionPlan {
             }
             output[*off..*off + bytes.len()].copy_from_slice(bytes);
         }
-        output[self.header..self.header + 8].copy_from_slice(b".sbrk\0\0\0");
-        put(&mut output, self.header + 8, virtual_size);
-        put(&mut output, self.header + 12, self.rva);
-        put(&mut output, self.header + 16, raw_size);
-        put(&mut output, self.header + 20, self.raw);
-        put(&mut output, self.header + 36, 0x6000_0020);
-        output[self.coff + 2..self.coff + 4]
-            .copy_from_slice(&((pe.layout().sections.len() + 1) as u16).to_le_bytes());
+        if let Some(last) = self.extend {
+            let delta = self.rva - last.virtual_address;
+            put(
+                &mut output,
+                self.header + 8,
+                delta
+                    .checked_add(virtual_size)
+                    .context("extended virtual size overflow")?,
+            );
+            put(
+                &mut output,
+                self.header + 16,
+                delta
+                    .checked_add(raw_size)
+                    .context("extended raw size overflow")?,
+            );
+            // Keep existing permissions, add executable/read/code, and retain
+            // unwind metadata by clearing DISCARDABLE for the enlarged section.
+            put(
+                &mut output,
+                self.header + 36,
+                (last.characteristics | 0x6000_0020) & !0x0200_0000,
+            );
+        } else {
+            output[self.header..self.header + 8].copy_from_slice(&self.name);
+            put(&mut output, self.header + 8, virtual_size);
+            put(&mut output, self.header + 12, self.rva);
+            put(&mut output, self.header + 16, raw_size);
+            put(&mut output, self.header + 20, self.raw);
+            put(&mut output, self.header + 36, 0x6000_0020);
+            output[self.coff + 2..self.coff + 4]
+                .copy_from_slice(&((pe.layout().sections.len() + 1) as u16).to_le_bytes());
+        }
         put(&mut output, self.opt + 56, image_size);
         put(
             &mut output,

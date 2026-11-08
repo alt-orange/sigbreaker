@@ -71,6 +71,7 @@ fn injection_preserves_inline_data_but_changes_reachable_instruction() {
 fn movement_preserves_functions_with_exception_handlers() {
     let mut fixture = metadata_fixture(common::SAMPLE_CODE);
     fixture.data[0x880] = 1 | (1 << 3); // version 1, EHANDLER
+    fixture.data[0x884..0x888].copy_from_slice(&0x1000u32.to_le_bytes());
     let pe = PeFile::parse(fixture.data).unwrap();
     let a = Analysis::run(pe.layout(), &pe.data).unwrap();
     let mut output = pe.data.clone();
@@ -181,9 +182,10 @@ fn prologue_and_stack_restoration_remain_byte_identical() {
 #[test]
 fn unsupported_unwind_formats_never_enable_register_scheduling() {
     let code = [0x90, 0xB8, 1, 0, 0, 0, 0xB9, 2, 0, 0, 0, 0xC3];
-    for header in [1 | (1 << 3), 1 | (2 << 3), 1 | (4 << 3), 2, 3] {
+    for header in [1 | (1 << 3), 1 | (2 << 3), 2, 3] {
         let mut fixture = metadata_fixture(&code);
         fixture.data[0x880] = header;
+        fixture.data[0x884..0x888].copy_from_slice(&0x1000u32.to_le_bytes());
         let pe = PeFile::parse(fixture.data).unwrap();
         let a = Analysis::run(pe.layout(), &pe.data).unwrap();
         let mut output = pe.data.clone();
@@ -216,4 +218,100 @@ fn rejects_truncated_exception_directory_and_short_optional_header() {
     let mut fixture = TestPe::new();
     fixture.data[0x54..0x56].copy_from_slice(&2u16.to_le_bytes());
     assert!(PeFile::parse(fixture.data).is_err());
+}
+
+#[test]
+fn chained_unwind_protects_primary_and_rejects_cycles_and_mismatches() {
+    let mut p = metadata_fixture(&[0x90, 0xC3]);
+    p.data[0x410..0x412].copy_from_slice(&[0x90, 0xC3]);
+    p.data[0xE4..0xE8].copy_from_slice(&24u32.to_le_bytes());
+    for (at, value) in [
+        (0x84C, 0x1010u32),
+        (0x850, 0x1012),
+        (0x854, 0x2090),
+        (0x894, 0x1000),
+        (0x898, 0x1002),
+        (0x89C, 0x2080),
+    ] {
+        p.data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    p.data[0x890] = 1 | 4 << 3;
+    let pe = PeFile::parse(p.data.clone()).unwrap();
+    assert_eq!(pe.layout().metadata_pinned, vec![0x1000..0x1002]);
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    assert!(a.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instrs)
+        .all(|i| i.pinned));
+    let mut mismatch = p.data.clone();
+    mismatch[0x89C..0x8A0].copy_from_slice(&0x2084u32.to_le_bytes());
+    assert!(PeFile::parse(mismatch).is_err());
+    p.data[0x880] = 1 | 4 << 3;
+    p.data.copy_within(0x84C..0x858, 0x884);
+    assert!(PeFile::parse(p.data)
+        .unwrap_err()
+        .to_string()
+        .contains("cyclic"));
+}
+
+#[test]
+fn readonly_rva_and_absolute_tables_protect_interior_code() {
+    let mut p = metadata_fixture(&[0x90, 0x90, 0xC3]);
+    p.data[0x820..0x824].copy_from_slice(&0x1001u32.to_le_bytes());
+    p.data[0x828..0x830].copy_from_slice(&0x140001002u64.to_le_bytes());
+    let pe = PeFile::parse(p.data).unwrap();
+    let targets = pe.layout().data_code_references(&pe.data);
+    assert!(targets.contains(&0x1001));
+    assert!(targets.contains(&0x1002));
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    assert!(a.range_externally_referenced(0, 0x1001..0x1003));
+}
+
+#[test]
+fn lea_scheduling_changes_code_and_preserves_address_arithmetic() {
+    use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+    use std::collections::HashMap;
+    let code = [0x90, 0x8D, 0x41, 3, 0x8D, 0x51, 5, 0x01, 0xD0, 0xC3];
+    let pe = PeFile::parse(metadata_fixture(&code).data).unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    let mut changed = false;
+    for seed in 0..32 {
+        let mut output = pe.data.clone();
+        let count = reorder::run(
+            &a,
+            pe.layout(),
+            &mut output,
+            &reorder::Config { probability: 1.0 },
+            &mut StdRng::seed_from_u64(seed),
+        );
+        changed |= count.applied > 0;
+        for input in [0u32, 1, 100, u32::MAX] {
+            let mut regs = HashMap::from([(Register::RCX, input)]);
+            let mut d = Decoder::with_ip(
+                64,
+                &output[0x400..0x400 + code.len()],
+                pe.layout().va(0x1000),
+                DecoderOptions::NONE,
+            );
+            while d.can_decode() {
+                let i = d.decode();
+                match i.mnemonic() {
+                    Mnemonic::Lea => {
+                        let value =
+                            regs[&i.memory_base()].wrapping_add(i.memory_displacement64() as u32);
+                        regs.insert(i.op0_register(), value);
+                    }
+                    Mnemonic::Add => {
+                        let value = regs[&i.op0_register()].wrapping_add(regs[&i.op1_register()]);
+                        regs.insert(i.op0_register(), value);
+                    }
+                    Mnemonic::Nop | Mnemonic::Ret => (),
+                    _ => panic!("unexpected instruction"),
+                }
+            }
+            assert_eq!(regs[&Register::EAX], input.wrapping_mul(2).wrapping_add(8));
+        }
+    }
+    assert!(changed);
 }

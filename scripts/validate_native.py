@@ -15,7 +15,7 @@ from pe_fixture_checks import relocated_export
 WORKSPACE = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser()
 parser.add_argument('--cpp', action='store_true', help='include MSVC EXE/DLL fixtures built by build_cpp_fixture.ps1')
-options = parser.parse_args()
+settings = parser.parse_args()
 ROOT = WORKSPACE / "target" / "runtime-validation"
 ROOT.mkdir(parents=True, exist_ok=True)
 TOOL = WORKSPACE / "target" / "release" / "sigbraker.exe"
@@ -118,7 +118,8 @@ rg_cases = [
 ]
 targets = [("native_probe", probe, [(c[0], c[1]) for c in probe_cases]), ("ripgrep", rg, rg_cases)]
 cpp_expected = {}
-if options.cpp:
+seh_expected = {'0': '18 24 77 5\r\n', '1': '113 111 111 4\r\n', '2': '113 111 222 5\r\n', '3': '18 24 333 5\r\n'}
+if settings.cpp:
     cpp_source = WORKSPACE / 'target' / 'native-fixtures' / 'native_cpp.exe'
     if not cpp_source.exists():
         raise SystemExit('Build the C++ fixture with scripts/build_cpp_fixture.ps1 first')
@@ -138,6 +139,9 @@ if options.cpp:
     dll = RUN / 'native_dll.original.dll'
     shutil.copy2(dll_source, dll)
     targets.append(('native_dll', dll, [(case, [case]) for case in cpp_expected]))
+    seh = RUN / 'native_seh.original.exe'
+    shutil.copy2(WORKSPACE / 'target' / 'native-fixtures' / 'native_seh.exe', seh)
+    targets.append(('native_seh', seh, [(mode, [mode]) for mode in seh_expected]))
 result = {"run_directory": str(RUN), "targets": {}, "variants": []}
 baseline = {}
 for name, original, cases in targets:
@@ -165,16 +169,25 @@ for case, (code, stdout, stderr) in cpp_expected.items():
     for name in ('native_cpp', 'native_dll'):
         if signature(baseline[name][case]) != (code, stdout.encode().hex(), stderr.encode().hex(), None):
             raise SystemExit(f'{name} baseline failed independent expectation: {case}')
+if settings.cpp:
+    for mode, stdout in seh_expected.items():
+        if signature(baseline['native_seh'][mode]) != (0, stdout.encode().hex(), '', None):
+            raise SystemExit(f'SEH baseline failed independent expectation: {mode}')
 
 modes = {
     "control": ["--no-seg-inject", "--no-reorder", "--no-shuffle"],
-    "segment_only": ["--no-reorder", "--no-shuffle"],
+    "segment_only": ["--no-reorder", "--no-shuffle", "--no-grow-segments"],
     "reorder_only": ["--no-seg-inject", "--no-shuffle"],
     "shuffle_only": ["--no-seg-inject", "--no-reorder"],
     "default": [],
+    "growing_segments": ["--grow-segments", "--seg-prob", "1", "--no-reorder", "--no-shuffle"],
 }
 for name, original, cases in targets:
     for mode, options in modes.items():
+        # The SEH/assembly fixture targets layout and unwinding. Individual
+        # prefix/scheduler coverage is supplied by the Rust/C++/ripgrep fixtures.
+        if name == 'native_seh' and mode in ('segment_only', 'reorder_only'):
+            continue
         seeds = [1397311314] if mode == "control" else [1397311314, 7, 42]
         for seed in seeds:
             tag = f"{name}.{mode}.{seed}"
@@ -197,6 +210,8 @@ for name, original, cases in targets:
                 row["code_changed_bytes"] = changed_executable_bytes(before, after)
                 if name in ('native_cpp', 'native_dll'):
                     row['relocated_stackwalk'] = relocated_export(after, 'walk')
+                if name == 'native_seh':
+                    row['relocated_exception_functions'] = {export: relocated_export(after, export) for export in ('seh_probe', 'seh_nested', 'chained_body', 'tail_probe')}
                 failed = []
                 for case, args in cases:
                     observation = execute(target_command(name, output, args), timeout=5)
@@ -211,6 +226,8 @@ for name, original, cases in targets:
                 row["status"] = "runtime_mismatch" if failed else "passed"
                 if not failed and mode != "control" and row["code_changed_bytes"] == 0:
                     row["status"] = "no_code_change"
+                if not failed and mode == 'growing_segments' and row['output_bytes'] <= row['input_bytes']:
+                    row['status'] = 'no_code_change'
                 row["failed_cases"] = failed
                 print(f"{row['status'].upper()} {tag}: {len(row['cases'])}/{len(cases)} cases, "
                       f"{row['changed_bytes']} changed bytes" + (f", failures={failed}" if failed else ""), flush=True)
@@ -227,9 +244,15 @@ result['relocated_stackwalk_coverage'] = {
               for row in result['variants'])
     for name, _, _ in targets if name in ('native_cpp', 'native_dll')
 }
+result['relocated_exception_coverage'] = {
+    export: any(row['target'] == 'native_seh' and row.get('relocated_exception_functions', {}).get(export) and row['status'] == 'passed' for row in result['variants'])
+    for export in ('seh_probe', 'seh_nested', 'chained_body', 'tail_probe') if settings.cpp
+}
 (RUN / "results.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
 print(f"SUMMARY {summary}", flush=True)
 print(f"RESULTS {RUN / 'results.json'}", flush=True)
 print(f"RELOCATED STACK WALK {result['relocated_stackwalk_coverage']}", flush=True)
+print(f"RELOCATED EXCEPTIONS {result['relocated_exception_coverage']}", flush=True)
 raise SystemExit(0 if all(r["status"] == "passed" for r in result["variants"])
-                 and all(result['relocated_stackwalk_coverage'].values()) else 1)
+                 and all(result['relocated_stackwalk_coverage'].values())
+                 and all(result['relocated_exception_coverage'].values()) else 1)

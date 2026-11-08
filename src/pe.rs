@@ -60,6 +60,11 @@ pub struct PeLayout {
     /// Authoritative code extents from the PE exception directory.
     pub runtime_functions: Vec<Range<u32>>,
     pub code_roots: BTreeSet<u32>,
+    /// Code ranges whose original unwind addresses are referenced by chains.
+    pub metadata_pinned: Vec<Range<u32>>,
+    pub c_specific: BTreeMap<u32, crate::exception::CSpecific>,
+    pub guarded_eh_continuations: bool,
+    pub import_slots: BTreeSet<u32>,
     unwind: BTreeMap<u32, UnwindInfo>,
     /// File-offset ranges the loader patches via `.reloc`; never touch these.
     protected: Vec<Range<usize>>,
@@ -74,6 +79,26 @@ pub struct UnwindInfo {
     /// Only plain version-1 functions are supported by the register scheduler.
     /// Handler-bearing, chained, and newer formats remain pinned.
     pub permits_register_reordering: bool,
+    pub kind: UnwindKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnwindKind {
+    Plain,
+    Handler {
+        flags: u8,
+        handler_rva: u32,
+        data_rva: u32,
+    },
+    Chained {
+        begin: u32,
+        end: u32,
+        unwind_rva: u32,
+    },
+    Unsupported {
+        version: u8,
+        flags: u8,
+    },
 }
 
 impl PeLayout {
@@ -132,6 +157,45 @@ impl PeLayout {
                     .then_some(rva)
             })
             .collect()
+    }
+
+    /// Conservative RVA and VA pointer-table analysis. Values are candidates,
+    /// not proof of an executable edge; false positives only restrict movement.
+    pub fn data_code_references(&self, data: &[u8]) -> BTreeSet<u32> {
+        let mut targets = BTreeSet::new();
+        for section in self
+            .sections
+            .iter()
+            .filter(|s| !s.is_executable() && s.characteristics & 0x8000_0000 == 0)
+        {
+            let range = self.section_raw_range(section, data.len());
+            for at in (range.start..range.end).step_by(4) {
+                if self
+                    .c_specific
+                    .values()
+                    .any(|info| info.table_bytes.contains(&at))
+                {
+                    continue;
+                }
+                if let Some(bytes) = data.get(at..at + 4).filter(|_| at + 4 <= range.end) {
+                    let rva = u32::from_le_bytes(bytes.try_into().unwrap());
+                    if self.executable_sections().any(|s| s.contains_rva(rva)) {
+                        targets.insert(rva);
+                    }
+                }
+                if let Some(bytes) = data.get(at..at + 8).filter(|_| at + 8 <= range.end) {
+                    if let Some(rva) = u64::from_le_bytes(bytes.try_into().unwrap())
+                        .checked_sub(self.image_base)
+                        .and_then(|v| u32::try_from(v).ok())
+                    {
+                        if self.executable_sections().any(|s| s.contains_rva(rva)) {
+                            targets.insert(rva);
+                        }
+                    }
+                }
+            }
+        }
+        targets
     }
 }
 
@@ -240,6 +304,10 @@ impl PeFile {
             protected: Vec::new(),
             runtime_functions: Vec::new(),
             code_roots: BTreeSet::from([entry_rva]),
+            metadata_pinned: Vec::new(),
+            c_specific: BTreeMap::new(),
+            guarded_eh_continuations: false,
+            import_slots: BTreeSet::new(),
             unwind: BTreeMap::new(),
         };
         let directory = |index: usize| -> Result<Option<Range<usize>>> {
@@ -276,7 +344,17 @@ impl PeFile {
         };
         let mut runtime_functions = Vec::new();
         let mut unwind = BTreeMap::new();
+        let mut metadata_pinned = Vec::new();
         let mut code_roots = layout.code_roots.clone();
+        let imports = crate::exception::imports(&layout, &data, directory(1)?)?;
+        let guarded_eh_continuations = if let Some(config) = directory(10)? {
+            config.len() >= 148
+                && u32_le(&data, config.start)? >= 148
+                && u32_le(&data, config.start + 144)? & 0x0040_0000 != 0
+        } else {
+            false
+        };
+        let mut c_specific = BTreeMap::new();
         if let Some(exports) = directory(0)? {
             if exports.len() < 40 {
                 bail!("truncated export directory");
@@ -338,6 +416,63 @@ impl PeFile {
                 if version == 1 && slots_end > data.len() {
                     bail!("truncated unwind codes");
                 }
+                let kind = if version == 1 && flags & !7 == 0 {
+                    if flags & 4 != 0 {
+                        if flags & 3 != 0 {
+                            bail!("chained unwind record also declares a handler");
+                        }
+                        let begin = u32_le(&data, slots_end)?;
+                        let chain_end = u32_le(&data, slots_end + 4)?;
+                        let chain_unwind = u32_le(&data, slots_end + 8)?;
+                        if begin >= chain_end || layout.rva_to_offset(chain_unwind).is_none() {
+                            bail!("invalid chained runtime function");
+                        }
+                        metadata_pinned.push(begin..chain_end);
+                        UnwindKind::Chained {
+                            begin,
+                            end: chain_end,
+                            unwind_rva: chain_unwind,
+                        }
+                    } else if flags & 3 != 0 {
+                        let handler_rva = u32_le(&data, slots_end)?;
+                        if !layout
+                            .executable_sections()
+                            .any(|s| s.contains_rva(handler_rva))
+                        {
+                            bail!("unmapped exception handler");
+                        }
+                        code_roots.insert(handler_rva);
+                        let data_rva = unwind_rva
+                            .checked_add((slots_end + 4 - header) as u32)
+                            .context("handler data overflow")?;
+                        if crate::exception::is_c_specific(&layout, &data, &imports, handler_rva) {
+                            let scopes = crate::exception::parse(
+                                &layout,
+                                &data,
+                                start..end,
+                                handler_rva,
+                                data_rva,
+                            )?;
+                            for scope in &scopes.scopes {
+                                if scope.handler > 1 {
+                                    code_roots.insert(scope.handler);
+                                }
+                            }
+                            c_specific.insert(start, scopes);
+                        }
+                        UnwindKind::Handler {
+                            flags,
+                            handler_rva,
+                            data_rva: unwind_rva
+                                .checked_add((slots_end + 4 - header) as u32)
+                                .context("handler data overflow")?,
+                        }
+                    } else {
+                        UnwindKind::Plain
+                    }
+                } else {
+                    UnwindKind::Unsupported { version, flags }
+                };
                 unwind.insert(
                     start,
                     UnwindInfo {
@@ -346,12 +481,36 @@ impl PeFile {
                         permits_register_reordering: version == 1
                             && flags == 0
                             && unwind_rva % 4 == 0,
+                        kind,
                     },
                 );
             }
             runtime_functions.sort_by_key(|r| r.start);
             if runtime_functions.windows(2).any(|w| w[0].end > w[1].start) {
                 bail!("overlapping runtime function extents");
+            }
+            // A chain references a complete primary runtime record. Require a
+            // matching parsed record and reject cycles before any transform.
+            for info in unwind.values() {
+                let mut current = info;
+                let mut seen = BTreeSet::new();
+                while let UnwindKind::Chained {
+                    begin,
+                    end,
+                    unwind_rva,
+                } = current.kind
+                {
+                    if !seen.insert(current.rva) {
+                        bail!("cyclic unwind chain");
+                    }
+                    if !runtime_functions.contains(&(begin..end)) {
+                        bail!("unresolved chained function extent");
+                    }
+                    current = unwind.get(&begin).context("unresolved unwind chain")?;
+                    if current.rva != unwind_rva {
+                        bail!("chained unwind address mismatch");
+                    }
+                }
             }
         }
         let protected = collect_relocations(&data, &layout, directory(5)?)?;
@@ -362,6 +521,10 @@ impl PeFile {
                 runtime_functions,
                 unwind,
                 code_roots,
+                metadata_pinned,
+                c_specific,
+                guarded_eh_continuations,
+                import_slots: imports.keys().copied().collect(),
                 ..layout
             },
         })

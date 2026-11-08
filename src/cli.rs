@@ -58,7 +58,7 @@ pub struct Cli {
     pub seed: u64,
 
     /// Probability [0, 1] of injecting a segment override into an eligible instruction.
-    #[arg(long, default_value_t = 0.35)]
+    #[arg(long, default_value_t = 1.0)]
     pub seg_prob: f64,
 
     /// Whitelist of segment overrides allowed for injection.
@@ -71,16 +71,24 @@ pub struct Cli {
     pub segments: Vec<SegmentName>,
 
     /// Probability [0, 1] of scheduling an eligible instruction run or block.
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 1.0)]
     pub reorder_prob: f64,
 
     /// Probability [0, 1] of relocating eligible blocks or shuffling block chains.
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 1.0)]
     pub shuffle_prob: f64,
 
     /// Disable segment selector injection.
     #[arg(long)]
     pub no_seg_inject: bool,
+
+    /// Allow segment prefixes to grow eligible relocated functions (enabled by default).
+    #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = true, overrides_with = "no_grow_segments")]
+    pub grow_segments: bool,
+
+    /// Limit segment injection to existing instruction lengths.
+    #[arg(long, overrides_with = "grow_segments")]
+    pub no_grow_segments: bool,
 
     /// Disable instruction reordering.
     #[arg(long)]

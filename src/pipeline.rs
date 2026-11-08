@@ -63,6 +63,17 @@ pub fn run(cli: &Cli) -> Result<String> {
         );
         return Ok(report);
     }
+    // Growing prefixes are automatic where supported. Disabling injection also
+    // disables growth; metadata-free inputs retain their in-place fallback.
+    let grow_segments = cli.grow_segments
+        && !cli.no_grow_segments
+        && !cli.no_seg_inject
+        && !cli.segments.is_empty()
+        && cli.seg_prob > 0.0
+        && !layout.runtime_functions.is_empty();
+    // Count unique functions by their final code bytes, excluding header-only
+    // changes, reverted edits, and duplicate transformations across passes.
+    let original_data = pe.data.clone();
 
     let mut pass = |name: &str, detail: String, c: crate::stats::Counters| {
         let _ = writeln!(report, "  [pass] {name}: {detail} ({c})");
@@ -109,9 +120,23 @@ pub fn run(cli: &Cli) -> Result<String> {
     }
 
     // Pass 3 — basic block shuffling.
-    if !cli.no_shuffle {
+    if !cli.no_shuffle || grow_segments {
         if !layout.runtime_functions.is_empty() {
-            let c = relayout::run(&lifted, &mut pe, cli.shuffle_prob, &mut rng)?;
+            let segments = grow_segments.then(|| segment_inject::Config {
+                probability: cli.seg_prob,
+                segments: cli.segments.iter().map(|s| s.register()).collect(),
+            });
+            let c = relayout::run_with_segments(
+                &lifted,
+                &mut pe,
+                if cli.no_shuffle {
+                    0.0
+                } else {
+                    cli.shuffle_prob
+                },
+                &mut rng,
+                segments.as_ref(),
+            )?;
             pass(
                 "basic block relocation",
                 "expanded layout, explicit jumps, updated runtime-function table".into(),
@@ -139,6 +164,25 @@ pub fn run(cli: &Cli) -> Result<String> {
             "  verified : OK — in-place decoding and generated instruction/branch layouts checked"
         );
     }
+
+    let transformed = analysis
+        .functions
+        .iter()
+        .filter(|func| {
+            let range = func.off..func.off + (func.end_rva - func.start_rva) as usize;
+            original_data[range.clone()] != pe.data[range]
+        })
+        .count();
+    let total = analysis.functions.len();
+    let percentage = if total == 0 {
+        0.0
+    } else {
+        100.0 * transformed as f64 / total as f64
+    };
+    let _ = writeln!(
+        report,
+        "  transformed: {transformed}/{total} functions ({percentage:.2}%)"
+    );
 
     pe.update_checksum();
     let out_path = cli

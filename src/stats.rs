@@ -6,12 +6,17 @@
 /// omitted from the printed report.
 #[derive(Debug, Default, Clone)]
 pub struct Counters {
+    /// Specific reasons for excluding functions from expanded layout.
+    pub skipped_reasons: std::collections::BTreeMap<&'static str, u64>,
     /// Movement skipped because unwind/exception metadata is not rewritten.
     pub skipped_metadata: u64,
     /// Eligible items seen (instructions, blocks, functions…).
     pub candidates: u64,
     /// Items actually transformed.
     pub applied: u64,
+    pub relocated_c_specific: u64,
+    pub relocated_chained: u64,
+    pub relocated_import_tails: u64,
     /// Instructions whose bytes were rewritten or relocated in place.
     pub instructions_touched: u64,
     /// Items skipped because they overlap a base-relocation fixup.
@@ -32,12 +37,18 @@ impl Counters {
             }
         };
         push("applied", self.applied);
+        push("C-specific SEH functions", self.relocated_c_specific);
+        push("chained unwind functions", self.relocated_chained);
+        push("import-tail functions", self.relocated_import_tails);
         push("skipped (unwind/exception metadata)", self.skipped_metadata);
         push("instructions touched", self.instructions_touched);
         push("candidates", self.candidates);
         push("skipped (relocated bytes)", self.skipped_pinned);
         push("skipped (no in-place room)", self.skipped_no_room);
         push("reverted", self.reverted);
+        for (reason, count) in &self.skipped_reasons {
+            push(&format!("skipped ({reason})"), *count);
+        }
         if parts.is_empty() {
             return "nothing done".to_string();
         }

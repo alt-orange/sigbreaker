@@ -35,6 +35,8 @@ def relocated_export(data, export_name):
             return None
         runtime, size = struct.unpack_from('<II', data, opt + 112 + 3 * 8)
         entries = [struct.unpack_from('<III', data, offset(runtime) + index) for index in range(0, size, 12)]
-        assert any(begin == target for begin, _, _ in entries), 'relocated export lacks runtime-function entry'
-        return {'entry_rva': rva, 'relocated_rva': target}
+        moved = next((entry for entry in entries if entry[0] == target), None)
+        original = next((entry for entry in entries if entry[0] == rva), None)
+        assert moved and original, 'relocated export lacks runtime-function entry'
+        return {'entry_rva': rva, 'relocated_rva': target, 'original_unwind_rva': original[2], 'relocated_unwind_rva': moved[2]}
     raise AssertionError(f'Missing fixture export: {export_name}')

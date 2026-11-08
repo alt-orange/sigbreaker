@@ -164,11 +164,26 @@ fn eligible_register_instruction(ins: &Instr, prologue_end: u32) -> bool {
                 | Mnemonic::Dec
                 | Mnemonic::Cmp
                 | Mnemonic::Test
+                | Mnemonic::Lea
+                | Mnemonic::Imul
+                | Mnemonic::Shl
+                | Mnemonic::Shr
+                | Mnemonic::Sar
+                | Mnemonic::Rol
+                | Mnemonic::Ror
+                | Mnemonic::Bswap
         )
     {
         return false;
     }
     for op in 0..ins.iced.op_count() {
+        if ins.iced.mnemonic() == Mnemonic::Lea
+            && op == 1
+            && ins.iced.op_kind(op) == OpKind::Memory
+            && !ins.iced.is_ip_rel_memory_operand()
+        {
+            continue;
+        }
         if !matches!(
             ins.iced.op_kind(op),
             OpKind::Register
@@ -186,7 +201,7 @@ fn eligible_register_instruction(ins: &Instr, prologue_end: u32) -> bool {
     }
     let mut factory = InstructionInfoFactory::new();
     let info = factory.info(&ins.iced);
-    info.used_memory().is_empty()
+    (info.used_memory().is_empty() || ins.iced.mnemonic() == Mnemonic::Lea)
         && info.used_registers().iter().all(|r| {
             matches!(
                 r.register().full_register(),

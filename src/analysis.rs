@@ -130,6 +130,7 @@ impl Analysis {
         let mut functions = Vec::new();
         let mut branch_owners: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
         let mut call_targets = pe.relocated_code_references(data);
+        call_targets.extend(pe.data_code_references(data));
         call_targets.extend(pe.code_roots.iter().copied());
         let roots = if pe.runtime_functions.is_empty() {
             Self::discover_roots(pe, data)
@@ -329,7 +330,12 @@ impl Analysis {
                 break;
             }
             let len = ins.len();
-            let pinned = pe.is_protected(cur..cur + len);
+            let rva = sec.virtual_address + (cur - sec.raw_ptr as usize) as u32;
+            let pinned = pe.is_protected(cur..cur + len)
+                || pe
+                    .metadata_pinned
+                    .iter()
+                    .any(|range| range.start < rva + len as u32 && rva < range.end);
             instrs.push(Instr {
                 off: cur,
                 rva: sec.virtual_address + (cur - sec.raw_ptr as usize) as u32,
@@ -355,6 +361,14 @@ impl Analysis {
                 .map(|(i, ins)| (ins.rva, i))
                 .collect();
             let mut pending = vec![base_rva];
+            if let Some(info) = pe.c_specific.get(&base_rva) {
+                pending.extend(
+                    info.scopes
+                        .iter()
+                        .filter(|s| s.target != 0)
+                        .map(|s| s.target),
+                );
+            }
             let mut reached = HashSet::new();
             let mut ambiguous = false;
             while let Some(rva) = pending.pop() {
@@ -398,8 +412,19 @@ impl Analysis {
 
         // Boundaries: region start, branch targets, after each terminator.
         let mut bounds: BTreeSet<usize> = BTreeSet::from([0]);
+        let scope_boundaries: BTreeSet<_> = pe
+            .c_specific
+            .get(&base_rva)
+            .into_iter()
+            .flat_map(|info| &info.scopes)
+            .flat_map(|s| [s.begin, s.end, s.target])
+            .collect();
         for (k, ins) in instrs.iter().enumerate() {
-            if k > 0 && (targets.contains(&ins.rva) || instrs[k - 1].ends_block()) {
+            if k > 0
+                && (targets.contains(&ins.rva)
+                    || scope_boundaries.contains(&ins.rva)
+                    || instrs[k - 1].ends_block())
+            {
                 bounds.insert(k);
             }
         }

@@ -3,7 +3,7 @@
 //! SigBreaker is built on top of BLARE, a lightweight binary transformation
 //! layer that heuristically lifts executable sections into an instruction-level
 //! representation (functions → basic blocks → instructions), applies
-//! diversification passes, and writes the result back in place:
+//! diversification passes, and emits a validated PE image:
 //!
 //! 1. **Segment selector injection** — random segment override prefixes are
 //!    injected into instructions with memory operands, chosen from a
@@ -14,14 +14,15 @@
 //! 3. **Basic block shuffling** — chains of basic blocks that pass movement
 //!    checks are relayouted, with recognized direct branches patched explicitly.
 //!
-//! Every transformation preserves file and section sizes. Internal instruction
-//! addresses can change; unwind metadata, exception tables, and indirect code
-//! references are not comprehensively validated or rewritten. Re-decoding checks
-//! instruction validity and counts, not behavioral equivalence.
+//! Supported version-1 functions can grow or move with updated runtime entries
+//! and recognized C-specific SEH scopes. Unknown exception formats and unresolved
+//! code references restrict movement. Structural checks and finite runtime tests
+//! do not establish equivalence for arbitrary input binaries.
 
 pub mod analysis;
 pub mod cli;
 pub mod dependencies;
+pub mod exception;
 pub mod pe;
 pub mod pipeline;
 pub mod stats;

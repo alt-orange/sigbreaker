@@ -1,13 +1,14 @@
 # Implementation status
 
 All three core passes are implemented within the supported boundaries in README.
-Expanded block layout is operational for eligible plain version-1 Windows unwind
-functions. Unsupported functions remain in place; this is not general rewriting
+Expanded block layout supports eligible plain-v1 functions, recognized C-specific
+SEH scope tables, and secondary unwind chains ending in a pinned plain primary. Unsupported functions remain in place; this is not general rewriting
 of arbitrary PE binaries.
 
 | Area | Implementation |
 | --- | --- |
 | PE parsing | `src/pe.rs`: sections, exports, runtime entries, unwind headers, base fixups, checksum |
+| SEH scopes | `src/exception.rs`: named-import handler identity, scope parsing, interval splitting and continuation mapping |
 | Discovery | `src/analysis.rs`: metadata extents; recursive entry/export/call roots otherwise; reachability pinning |
 | Scheduling | `src/dependencies.rs`, `src/transforms/reorder.rs`: dependency DAG and randomized topological order |
 | Prefixes | `src/transforms/segment_inject.rs`: whitelist and equal-length encoding |
@@ -49,10 +50,45 @@ paired timings with warmup, randomized order, and output checks.
 
 ## Deliberately unsupported scope
 
-Handler-specific scope tables and C++ exception metadata need dedicated format
-parsers and relocation logic before those functions can move. Chained and newer
-unwind formats, unresolved indirect jumps, arbitrary code/data mixtures, and
+C++ exception metadata and unknown handler formats need dedicated parsers before
+those functions can move. Chains terminating in handlers, newer unwind formats,
+unresolved indirect jumps, arbitrary code/data mixtures, and
 references from undiscovered code remain outside the relocation contract.
 Absence of a known reference is not proof that an unknown indirect reference
 does not exist. Additional program coverage and format support must be validated
 separately; passing this test matrix is not a universal equivalence guarantee.
+
+## Current follow-up implementation
+
+- Explicit version-1 handler/chained unwind model, handler address validation,
+  cycle/mismatch rejection, and protection for primary functions referenced by chains.
+- Conservative read-only RVA/VA code-pointer table analysis.
+- Broader non-faulting scalar scheduling, including address arithmetic.
+- Expanding segment injection is enabled by default where metadata permits;
+  `--no-grow-segments` opts out. All three pass probabilities default to 1.0.
+- Unique relocation section names for reprocessing, plus final-section extension
+  when no unused header slot exists and EOF/alignment/mapping checks permit it.
+- Windows/Linux CI, Windows native validation, deterministic malformed-input
+  mutation coverage, and repeated native reprocessing checks.
+
+FH3/FH4 and newer unwind translation, general jump-table
+rewriting, and deleting original bodies are still unfinished. Original bodies must
+remain available while reference discovery and exception table relocation are
+incomplete. Register-derived targets cannot be treated as resolved by scanning data.
+
+## Exception and import-tail support
+
+`src/exception.rs` resolves named imports through direct/indirect handler thunks
+and handles AMD64 C-specific SEH scope tables. It preserves nested scope priority,
+splits intervals using emitted instruction spans, and maps exception continuations.
+Synthetic fall-through jumps inherit their original successor PC for scope membership.
+The writer publishes copied unwind slots with rewritten scope data beside code.
+Known scope-table references are owned metadata rather than opaque pointers.
+
+Chained secondary regions can move when their chain ends at a plain primary;
+primary ranges stay pinned. RIP-relative indirect tail jumps through known named
+IAT slots retain their original memory target and contiguous restore sequence.
+`native_seh.c` and `native_chain.asm` test actual moved handler functions, a chained
+body, stack walking, exception propagation across that body, nested finally/filter
+execution, and import tail dispatch. These checks are distinct from merely testing
+preserved C++ handler functions.

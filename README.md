@@ -20,13 +20,34 @@ target/release/sigbraker.exe --help
 an adjacent temporary file and published by rename after validation. The same
 input, options, seed, and tool build produce identical output.
 
+The report prints `transformed: N/T functions (P%)`. This counts unique analyzed
+functions whose final original code span changed, including entry jumps to
+relocated code. Header/checksum changes and reverted edits do not count.
+The denominator includes all lifted functions, including unsupported ones.
+Default probabilities are `1.0`, and growing prefixes are enabled wherever the
+input supports expanded layout. Every eligible transformation is attempted;
+unsupported functions still retain their existing code layout.
+Expanded-layout reports list separate reasons for exclusions, including metadata,
+interior references, stack restoration, and insufficient blocks for shuffling.
+
+The default command selects the full coverage settings:
+
+```powershell
+sigbraker app.exe
+```
+
+Growing prefixes support one- and two-block functions as well as larger ones;
+actual block shuffling still requires at least three blocks with entry kept first.
+
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `--seed` | `1397311314` | Seed for all transformation randomness |
-| `--seg-prob` | `0.35` | Probability per eligible memory instruction |
+| `--seg-prob` | `1.0` | Probability per eligible memory instruction |
+| `--grow-segments` | on | Grow prefixes in eligible relocated functions |
+| `--no-grow-segments` | off | Restrict prefixes to existing instruction lengths |
 | `--segments` | `es,cs,ss,ds` | Segment-prefix whitelist |
-| `--reorder-prob` | `0.5` | Probability per eligible scheduling unit |
-| `--shuffle-prob` | `0.5` | Probability per eligible function |
+| `--reorder-prob` | `1.0` | Probability per eligible scheduling unit |
+| `--shuffle-prob` | `1.0` | Probability per eligible function |
 | `--no-seg-inject` | off | Disable prefix injection |
 | `--no-reorder` | off | Disable scheduling |
 | `--no-shuffle` | off | Disable block movement |
@@ -40,6 +61,11 @@ The pass inserts an allowed segment override when the instruction can be encoded
 at its original length. Removing a redundant zero displacement can make room for
 the prefix. Instructions without room, existing explicit segment overrides,
 unreachable instructions, and relocation-protected bytes are skipped.
+With `--grow-segments`, eligible supported functions can instead be relocated with
+longer prefixed encodings. Prologues keep their bytes and epilogues remain contiguous; this mode
+uses explicit jumps even with `--no-shuffle`. Without runtime metadata, injection
+automatically falls back to the existing instruction lengths. `--no-seg-inject`
+disables both forms; `--no-grow-segments` keeps in-place prefix injection enabled.
 
 FS and GS are excluded by default because their bases can affect memory addresses.
 Enabling them requires an environment where the resulting addressing is equivalent;
@@ -54,7 +80,9 @@ Randomized Kahn topological sorting selects a valid dependency order.
 For plain version-1 Windows unwind functions, scheduling is restricted to
 equal-length runs of non-faulting scalar operations on volatile registers.
 Prologues, stack changes, nonvolatile-register operations, memory operations, and
-calls retain their positions. Handler-bearing, chained, unknown-format, and
+calls retain their positions. Scalar LEA, integer multiply, shifts, rotates, and
+byte swaps are eligible when their operands and implicit state satisfy the same
+volatile-register and dependency checks. Handler-bearing, chained, unknown-format, and
 indirect-branch functions are excluded from this scheduler.
 
 Images without runtime metadata use a broader experimental scheduler. Known
@@ -75,12 +103,15 @@ Unchanged prologue unwind descriptions are reused. Original function bodies,
 section offsets, exports, and overlay bytes retain their original locations.
 Existing direct callers and function pointers continue through the original entry.
 
-Eligibility requires a fully decoded, reachable function with a closed direct
-control-flow graph, a complete unchanged prologue, contiguous supported epilogues,
+Eligibility requires a fully decoded, reachable function with resolved local
+control flow (plus recognized import tail exits), a complete unchanged prologue, contiguous supported epilogues,
 and no known interior address references. Unsupported branch expansions, indirect
-jumps, handler/chained unwind records, and relocation-pinned instructions prevent
-relocation. A free section-header slot is required; reprocessing an existing
-`.sbrk` image with relocation enabled is rejected.
+jumps, unknown handler formats, and relocation-pinned instructions prevent
+relocation. RIP-relative indirect tail jumps through named import slots are
+supported while retaining the same IAT slot and stack-restoring epilogue. New sections receive unique `.sbrk`, `.sbrk1`, etc. names when an image is
+reprocessed. If no header slot is free, the final section can grow when it ends
+at EOF, has no virtual-only tail, and meets alignment constraints. Existing raw
+offsets are retained. Unsupported extension layouts fail before publication.
 
 Without runtime metadata, the fallback shuffles in-place chains connected by
 fall-through. If branch displacements cannot fit, the attempted move is reverted.
@@ -97,6 +128,24 @@ The parser rejects truncated and overlapping sections and malformed relevant
 directories. Base relocations are read by directory, independently of section
 names. Absolute relocated code pointers, exported addresses, decoded calls,
 cross-function branches, and RIP-relative code references constrain movement.
+Read-only non-code sections are also scanned for aligned RVA and absolute-VA
+code pointers. Candidates conservatively restrict movement; arbitrary relative
+jump tables and register-derived targets remain unresolved.
+
+Version-1 handler and chained records are explicitly represented. Handler RVAs
+are checked; chain cycles, mismatched primary records, and unresolved chains are
+rejected. Primary code referenced by a chain is pinned. Secondary version-1
+chains ending at a plain primary can relocate while reusing the unchanged chain
+record. The primary itself remains fixed.
+
+Recognized AMD64 `__C_specific_handler` thunks imported from supported Microsoft
+runtime DLLs enable SEH scope relocation. Scope boundaries and exception entry
+points split blocks. New unwind records preserve the prologue slots and rewrite
+scope intervals and exception continuation RVAs, including split/nested scopes.
+Filters and finally funclets retain their original entry addresses. Unknown
+handlers and in-function filter funclets remain unsupported. Images using guarded
+EH continuation tables retain these functions in place until that table can be
+rewritten. Static CRT wrappers and C++ FH3/FH4 are not inferred from byte patterns.
 
 In-place verification checks decoding and instruction counts. Generated-layout
 verification additionally checks instruction operands and destinations, and the
@@ -112,6 +161,8 @@ cargo build --locked --release
 ./scripts/build_cpp_fixture.ps1
 python scripts/validate_native.py --cpp
 python scripts/benchmark_native.py target/runtime-validation/run-YYYYMMDD-HHMMSS/results.json
+python scripts/validate_reprocess.py target/runtime-validation/run-YYYYMMDD-HHMMSS/results.json
+python scripts/validate_exception_layouts.py target/runtime-validation/run-YYYYMMDD-HHMMSS/results.json
 python scripts/report_validation.py target/runtime-validation/run-YYYYMMDD-HHMMSS/results.json
 ```
 
@@ -132,9 +183,9 @@ through `SB_INPUT` / `SB_OUTPUT`; ordinary tests need no private local files.
 
 - AMD64 PE32+ only. Packed, self-modifying, overlapping-code, and deliberately
   obfuscated inputs are outside the supported scope.
-- Language-specific exception tables, chained unwind metadata, unresolved jump
-  tables, and newer unwind formats are not rewritten. A passing exception test
-  can include preserved handler functions; it does not imply those were relocated.
+- C++ FH3/FH4, unknown handler tables, unresolved jump tables, and newer unwind
+  formats remain unsupported. The native SEH fixture explicitly checks exported
+  handler functions and a chained secondary region moved before testing exceptions.
 - Undeclared indirect targets and references from unlifted code are not fully
   discoverable. Metadata-free transformation remains experimental.
 - Added jumps, code growth, and changed locality can affect performance. There
@@ -143,3 +194,7 @@ through `SB_INPUT` / `SB_OUTPUT`; ordinary tests need no private local files.
   integrity checks are not regenerated.
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the implementation map and remaining scope.
+
+The CI workflow runs Rust checks on Windows and Linux and native validation on
+Windows. A reproducible mutation smoke test exercises 2,048 malformed-input cases.
+Reprocessing validation runs saved native outputs through three further passes.
