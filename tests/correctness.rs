@@ -27,6 +27,7 @@ fn decode(code: &[u8]) -> Vec<Instr> {
             rva: 0x1000 + off as u32,
             len: iced.len(),
             pinned: false,
+            dead: false,
             iced,
         });
     }
@@ -241,3 +242,4 @@ fn cross_function_target_inside_block_prevents_reorder_and_shuffle() {
         );
     }
 }
+

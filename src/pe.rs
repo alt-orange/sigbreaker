@@ -66,12 +66,19 @@ pub struct PeLayout {
     pub cpp_eh: BTreeMap<u32, crate::cpp_eh::CppEh>,
     pub handler_symbols: BTreeMap<u32, String>,
     pub gs_handlers: BTreeMap<u32, Vec<u8>>,
+    /// Handlers identified only as "data blob without code references"; their
+    /// bytes are copied verbatim beside the relocated body.
+    pub opaque_handlers: BTreeMap<u32, Vec<u8>>,
     pub guarded_eh_continuations: bool,
     /// Sorted IMAGE_LOAD_CONFIG_DIRECTORY64 GuardEHContinuationTable entries.
     pub eh_continuation_table: Option<Range<usize>>,
     pub eh_continuation_fields: Option<(usize, usize)>,
     pub eh_continuations: BTreeSet<u32>,
     pub import_slots: BTreeSet<u32>,
+    /// File ranges covered by .xdata unwind records and their handler blobs.
+    /// Values inside them are unwind codes and language-table fields, not
+    /// data pointers into code.
+    pub unwind_bytes: Vec<Range<usize>>,
     unwind: BTreeMap<u32, UnwindInfo>,
     /// File-offset ranges the loader patches via `.reloc`; never touch these.
     protected: Vec<Range<usize>>,
@@ -195,7 +202,9 @@ impl PeLayout {
         {
             let range = self.section_raw_range(section, data.len());
             for at in (range.start..range.end).step_by(4) {
-                if owned.iter().any(|r| r.contains(&at)) {
+                if owned.iter().any(|r| r.contains(&at))
+                    || self.unwind_bytes.iter().any(|r| r.contains(&at))
+                {
                     continue;
                 }
                 if self
@@ -351,11 +360,13 @@ impl PeFile {
             cpp_eh: BTreeMap::new(),
             handler_symbols: handler_symbols.clone(),
             gs_handlers: BTreeMap::new(),
+            opaque_handlers: BTreeMap::new(),
             guarded_eh_continuations: false,
             eh_continuation_table: None,
             eh_continuation_fields: None,
             eh_continuations: BTreeSet::new(),
             import_slots: BTreeSet::new(),
+            unwind_bytes: Vec::new(),
             unwind: BTreeMap::new(),
         };
         let directory = |index: usize| -> Result<Option<Range<usize>>> {
@@ -405,6 +416,7 @@ impl PeFile {
         let mut c_specific = BTreeMap::new();
         let mut cpp_eh = BTreeMap::new();
         let mut gs_handlers = BTreeMap::new();
+        let mut opaque_handlers = BTreeMap::new();
         if handler_symbols
             .keys()
             .any(|r| !layout.executable_sections().any(|s| s.contains_rva(*r)))
@@ -414,6 +426,7 @@ impl PeFile {
         let mut eh_continuations = BTreeSet::new();
         let mut eh_continuation_table = None;
         let mut eh_continuation_fields = None;
+        let mut unwind_bytes = Vec::new();
         if let Some(config) = directory(10)? {
             let declared = u32_le(&data, config.start)? as usize;
             if declared > config.len() {
@@ -489,6 +502,9 @@ impl PeFile {
             if range.len() % 12 != 0 {
                 bail!("malformed exception directory");
             }
+            // First pass: validate extents and collect unwind RVAs so every
+            // record can bound its handler-data blob by the next record.
+            let mut records = Vec::new();
             for at in (range.start..range.end).step_by(12) {
                 let start = u32_le(&data, at)?;
                 let end = u32_le(&data, at + 4)?;
@@ -500,8 +516,30 @@ impl PeFile {
                 {
                     bail!("invalid runtime function extent");
                 }
+                records.push((start, end, u32_le(&data, at + 8)?));
+            }
+            let mut unwind_rvas: Vec<u32> = records.iter().map(|r| r.2).collect();
+            unwind_rvas.sort_unstable();
+            // Byte extent of every unwind record (header, codes, handler data)
+            // so value scans can ignore non-pointer xdata content.
+            for (_, _, unwind_rva) in &records {
+                let Some(header) = layout.rva_to_offset(*unwind_rva) else {
+                    continue;
+                };
+                let end_off = match unwind_rvas.iter().find(|&&r| r > *unwind_rva) {
+                    Some(&next) => layout.rva_to_offset(next),
+                    None => layout
+                        .sections
+                        .iter()
+                        .find(|s| s.contains_rva(*unwind_rva))
+                        .map(|s| (s.raw_ptr as usize + s.raw_size as usize).min(data.len())),
+                };
+                if let Some(end_off) = end_off.filter(|&end| end > header) {
+                    unwind_bytes.push(header..end_off);
+                }
+            }
+            for (start, end, unwind_rva) in records {
                 runtime_functions.push(start..end);
-                let unwind_rva = u32_le(&data, at + 8)?;
                 let header = layout
                     .rva_to_offset(unwind_rva)
                     .context("unmapped unwind info")?;
@@ -557,9 +595,30 @@ impl PeFile {
                         let data_rva = unwind_rva
                             .checked_add((slots_end + 4 - header) as u32)
                             .context("handler data overflow")?;
+                        let blob_end = unwind_rvas
+                            .iter()
+                            .find(|&&r| r > unwind_rva)
+                            .copied();
                         let identity = handler_symbols.get(&handler_rva).cloned().or_else(|| {
                             crate::exception::handler_name(&layout, &data, &imports, handler_rva)
                         });
+                        let identity = match identity {
+                            Some(name) => Some(name),
+                            None => match structural_identity(
+                                &layout,
+                                &data,
+                                start..end,
+                                data_rva,
+                                blob_end,
+                            ) {
+                                StructuralIdentity::Known(name) => Some(name.to_owned()),
+                                StructuralIdentity::Opaque(blob) => {
+                                    opaque_handlers.insert(start, blob);
+                                    None
+                                }
+                                StructuralIdentity::Unknown => None,
+                            },
+                        };
                         if matches!(
                             identity.as_deref(),
                             Some("__C_specific_handler" | "__GSHandlerCheck_SEH")
@@ -686,11 +745,13 @@ impl PeFile {
                 c_specific,
                 cpp_eh,
                 gs_handlers,
+                opaque_handlers,
                 guarded_eh_continuations,
                 eh_continuation_table,
                 eh_continuation_fields,
                 eh_continuations,
                 import_slots: imports.keys().copied().collect(),
+                unwind_bytes,
                 ..layout
             },
         })
@@ -739,6 +800,109 @@ fn u64_le(d: &[u8], off: usize) -> Result<u64> {
     d.get(off..off + 8)
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
         .context("truncated PE header")
+}
+
+/// Outcome of structurally validating an unrecognized handler's data blob.
+enum StructuralIdentity {
+    /// A handler whose data layout matches a known CRT ABI.
+    Known(&'static str),
+    /// A handler whose blob provably contains no code references, so it can be
+    /// copied verbatim beside the relocated body.
+    Opaque(Vec<u8>),
+    Unknown,
+}
+
+/// Identifies statically linked exception handlers by validating the data blob
+/// attached to the unwind record instead of relying on an import chain.
+///
+/// `blob_end` is the RVA where the next unwind record begins, bounding the
+/// handler data. `None` (last record in the image) keeps opaque detection off,
+/// because the blob extent cannot be proven.
+fn structural_identity(
+    pe: &PeLayout,
+    data: &[u8],
+    function: std::ops::Range<u32>,
+    data_rva: u32,
+    blob_end: Option<u32>,
+) -> StructuralIdentity {
+    let blob_len = blob_end
+        .map(|end| end.saturating_sub(data_rva))
+        .unwrap_or(0);
+    if pe.rva_to_offset(data_rva).is_none() {
+        return StructuralIdentity::Unknown;
+    }
+    let info_rva = |extra: u32| -> Option<u32> {
+        let off = pe.rva_to_offset(data_rva.checked_add(extra)?)?;
+        data.get(off..off + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+    };
+    // A GS cookie offset is a small frame displacement, never an image RVA or
+    // a magic constant. This gates every prefix/trailer detection below.
+    let plausible_gs = |flags: u32| flags != 0 && flags < 0x1_0000 && flags % 4 == 0;
+    let gs_after = |extra: u32| -> Option<Vec<u8>> {
+        let gs = crate::exception::gs_data(pe, data, data_rva.checked_add(extra)?).ok()?;
+        plausible_gs(u32::from_le_bytes(gs[..4].try_into().ok()?)).then_some(gs)
+    };
+    // FH3 and FH4 blobs are self-describing through an RVA to the function
+    // info; a GS cookie blob sits between that RVA and the info itself.
+    if let Ok(info) = crate::cpp_eh::parse(pe, data, function.clone(), 0, data_rva, false) {
+        let _ = info;
+        let info_rva = info_rva(0).unwrap_or(0);
+        if let Some(gs) = gs_after(4) {
+            if info_rva == data_rva + 4 + gs.len() as u32 {
+                return StructuralIdentity::Known("__GSHandlerCheck_EH");
+            }
+        }
+        return StructuralIdentity::Known("__CxxFrameHandler3");
+    }
+    if crate::cpp_eh::parse(pe, data, function.clone(), 0, data_rva, true).is_ok() {
+        let info_rva = info_rva(0).unwrap_or(0);
+        if let Some(gs) = gs_after(4) {
+            if info_rva == data_rva + 4 + gs.len() as u32 {
+                return StructuralIdentity::Known("__GSHandlerCheck_EH4");
+            }
+        }
+        return StructuralIdentity::Known("__CxxFrameHandler4");
+    }
+    // C-specific scope tables end either at the table or at a GS trailer.
+    if let Ok(scopes) = crate::exception::parse(pe, data, function.clone(), 0, data_rva) {
+        let table_len = scopes.table_bytes.len() as u32;
+        if blob_end.is_some() {
+            if blob_len == table_len {
+                return StructuralIdentity::Known("__C_specific_handler");
+            }
+            if let Some(gs) = gs_after(table_len) {
+                if blob_len == table_len + gs.len() as u32 {
+                    return StructuralIdentity::Known("__GSHandlerCheck_SEH");
+                }
+            }
+        }
+        return StructuralIdentity::Unknown;
+    }
+    // Anything else is relocatable only when the blob provably contains no
+    // reference into executable code: every aligned dword must fall outside
+    // every executable section. Such blobs are copied verbatim beside the
+    // relocated body (this also covers bare __GSHandlerCheck cookie blobs).
+    if let Some(blob_end) = blob_end {
+        if blob_len > 0 && blob_len <= 1024 {
+            if let (Some(start_off), Some(end_off)) = (
+                pe.rva_to_offset(data_rva),
+                pe.rva_to_offset(blob_end.saturating_sub(1)),
+            ) {
+                if end_off >= start_off + blob_len as usize - 1 {
+                    let blob = &data[start_off..start_off + blob_len as usize];
+                    let code_ref = blob
+                        .chunks_exact(4)
+                        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                        .any(|v| pe.executable_sections().any(|s| s.contains_rva(v)));
+                    if !code_ref {
+                        return StructuralIdentity::Opaque(blob.to_vec());
+                    }
+                }
+            }
+        }
+    }
+    StructuralIdentity::Unknown
 }
 
 /// Walks the `.reloc` section and records the file offset of every fixup.

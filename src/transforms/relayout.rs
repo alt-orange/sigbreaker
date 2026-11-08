@@ -2,7 +2,7 @@
 //! Old bodies remain available. Their entries jump to relocated copies, whose
 //! runtime entries retain prologue unwind slots and rewrite recognized SEH scopes.
 use crate::{
-    analysis::{Analysis, Function},
+    analysis::{Analysis, Function, Instr},
     pe::{PeFile, PeLayout},
     stats::Counters,
     writer::{align, SectionPlan},
@@ -47,16 +47,26 @@ pub fn encode_function(
         .flat_map(|b| &b.instrs)
         .map(|i| i.iced.ip())
         .collect();
-    for &bi in order {
+    for (position, &bi) in order.iter().enumerate() {
         let block = &func.blocks[bi];
         instructions.extend(block.instrs.iter().map(|i| i.iced));
         let last = block.instrs.last().context("empty basic block")?;
         if last.falls_through() {
-            let next = func
-                .blocks
-                .get(bi + 1)
-                .context("fall-through escapes function")?;
-            let mut jump = Instruction::with_branch(Code::Jmp_rel32_64, next.instrs[0].iced.ip())?;
+            // When the fall-through successor is emitted immediately after,
+            // control flows naturally and no synthetic jump is needed. This
+            // keeps multi-block prologues byte-contiguous.
+            if order.get(position + 1) == Some(&(bi + 1)) {
+                continue;
+            }
+            // The final block may fall through past the function extent (a
+            // trailing int3/ud2 or a trailing conditional branch). The original
+            // bytes at that address still execute exactly as before, so the
+            // copy jumps back to the original successor address.
+            let target_ip = match func.blocks.get(bi + 1) {
+                Some(next) => next.instrs[0].iced.ip(),
+                None => last.iced.next_ip(),
+            };
+            let mut jump = Instruction::with_branch(Code::Jmp_rel32_64, target_ip)?;
             while used_ips.contains(&next_synthetic) {
                 next_synthetic -= 1;
             }
@@ -218,7 +228,8 @@ fn eligible(
     f: &Function,
     index: usize,
     growing: bool,
-) -> Result<(), &'static str> {
+    stale_ok: bool,
+) -> Result<BTreeSet<u32>, &'static str> {
     let Some(info) = pe.unwind_info(f.start_rva) else {
         return Err("missing runtime metadata");
     };
@@ -241,10 +252,32 @@ fn eligible(
             && !pe.c_specific.contains_key(&f.start_rva)
             && !pe.cpp_eh.contains_key(&f.start_rva)
             && !pe.gs_handlers.contains_key(&f.start_rva)
+            && !pe.opaque_handlers.contains_key(&f.start_rva)
             && !(info.v2.is_some() && matches!(info.kind, crate::pe::UnwindKind::Plain))
             && !plain_chain)
     {
-        return Err("unsupported unwind metadata");
+        if info.rva % 4 != 0 {
+            return Err("unaligned unwind record");
+        }
+        match &info.kind {
+            crate::pe::UnwindKind::Unsupported { .. } => {
+                return Err("unsupported unwind version or flags");
+            }
+            crate::pe::UnwindKind::Handler { .. } => {
+                return Err("unrecognized handler data");
+            }
+            crate::pe::UnwindKind::Chained { begin, .. } => {
+                return Err(match pe.unwind_info(*begin).map(|p| &p.kind) {
+                    Some(crate::pe::UnwindKind::Handler { .. })
+                    | Some(crate::pe::UnwindKind::Unsupported { .. }) => {
+                        "chained to unsupported primary"
+                    }
+                    Some(_) => "chained to unsupported primary",
+                    None => "chained to unsupported primary",
+                });
+            }
+            crate::pe::UnwindKind::Plain => return Err("unsupported unwind metadata"),
+        }
     }
     if f.end_rva != extent.end {
         return Err("incomplete decoding");
@@ -255,10 +288,7 @@ fn eligible(
     if !growing && f.blocks.len() < 3 {
         return Err("too few blocks to shuffle");
     }
-    if f.blocks[0].end_rva < info.prologue_end {
-        return Err("split prologue");
-    }
-    if analysis.range_unrewritable_reference(index, f.start_rva + 1..f.end_rva) {
+    if !analysis.interior_movable(index, f.start_rva + 1..f.end_rva, stale_ok) {
         return Err("interior code reference");
     }
     let boundaries: BTreeSet<_> = f.blocks.iter().map(|b| b.start_rva).collect();
@@ -311,9 +341,33 @@ fn eligible(
         }
     }
     let mut factory = InstructionInfoFactory::new();
-    for b in &f.blocks {
+    let mut seen_dead = false;
+    let mut rsp_writes = Vec::new();
+    for (block_index, b) in f.blocks.iter().enumerate() {
         for (i, ins) in b.instrs.iter().enumerate() {
-            if ins.pinned || matches!(ins.iced.mnemonic(), Mnemonic::Endbr64 | Mnemonic::Endbr32) {
+            if ins.dead {
+                seen_dead = true;
+            } else if seen_dead {
+                return Err("interior dead code");
+            }
+            let trimmable = ins.dead
+                && !pe.is_protected(ins.off..ins.off + ins.len)
+                && !pe
+                    .metadata_pinned
+                    .iter()
+                    .any(|r| r.start < ins.rva + ins.len as u32 && ins.rva < r.end);
+            // Chain primaries are pinned because secondaries reference their
+            // original extent. Layouts that retain original bodies keep every
+            // stale reference consistent, so the primary may move.
+            let meta_pinned_only = !pe.is_protected(ins.off..ins.off + ins.len)
+                && pe
+                    .metadata_pinned
+                    .iter()
+                    .any(|r| r.start < ins.rva + ins.len as u32 && ins.rva < r.end);
+            let allowed_pinned = trimmable || (meta_pinned_only && stale_ok);
+            if (ins.pinned && !allowed_pinned)
+                || matches!(ins.iced.mnemonic(), Mnemonic::Endbr64 | Mnemonic::Endbr32)
+            {
                 return Err("pinned or unreachable instructions");
             }
             if !import_tail(&ins.iced, pe)
@@ -327,13 +381,29 @@ fn eligible(
                         | FlowControl::ConditionalBranch
                         | FlowControl::UnconditionalBranch
                         | FlowControl::Return
+                        // Interrupts (int3/int n) and exceptions (ud2/hlt)
+                        // transfer control to a handler or terminate; they
+                        // never resume into relocated code, so their blocks
+                        // can move like any other terminator.
+                        | FlowControl::Interrupt
+                        | FlowControl::Exception
                 )
             {
-                return Err("unsupported control flow");
+                return Err(match ins.iced.flow_control() {
+                    FlowControl::IndirectBranch => "unresolved indirect branch",
+                    _ => "unsupported control flow",
+                });
             }
             if let Some(target) = ins.branch_target_rva(pe.image_base) {
                 if !boundaries.contains(&target) {
-                    return Err("branch outside local blocks");
+                    // Out-of-function targets are stable: runtime entries keep
+                    // their trampoline, and any relocated interior is reached
+                    // through a retargetable near-form branch that the commit
+                    // phase rewrites.
+                    let entry = pe.runtime_functions.iter().any(|f| f.start == target);
+                    if !entry && !Analysis::retargetable(ins) {
+                        return Err("branch outside local blocks");
+                    }
                 }
             }
             if ins.iced.is_call_near() {
@@ -353,8 +423,8 @@ fn eligible(
                     return Err("self-referencing code memory");
                 }
             }
-            // Keep every stack-restoring epilogue contiguous within one block.
-            // Calls/returns have balanced implicit stack effects and are exempt.
+            // Record stack-restoring instructions; epilogues may continue into
+            // fall-through successor blocks, validated after the scan.
             if ins.rva >= info.prologue_end && ins.iced.flow_control() == FlowControl::Next {
                 let writes_rsp = factory.info(&ins.iced).used_registers().iter().any(|r| {
                     r.register().full_register() == Register::RSP
@@ -367,37 +437,82 @@ fn eligible(
                         )
                 });
                 if writes_rsp {
-                    let suffix = &b.instrs[i..];
-                    if suffix.last().is_none_or(|last| {
-                        last.iced.mnemonic() != Mnemonic::Ret && !import_tail(&last.iced, pe)
-                    }) {
-                        return Err("unsupported stack restoration");
-                    }
-                    for (j, item) in suffix[..suffix.len() - 1].iter().enumerate() {
-                        let pop = item.iced.mnemonic() == Mnemonic::Pop
-                            && item.iced.op0_register().is_gpr64();
-                        let restore = j == 0
-                            && matches!(item.iced.mnemonic(), Mnemonic::Add | Mnemonic::Lea)
-                            && item.iced.op0_register() == Register::RSP;
-                        if !pop && !restore {
-                            return Err("unsupported stack restoration");
-                        }
-                    }
+                    rsp_writes.push((block_index, i));
                 }
             }
         }
     }
-    if f.blocks
-        .last()
-        .unwrap()
-        .instrs
-        .last()
-        .unwrap()
-        .falls_through()
-    {
-        return Err("fall-through outside function");
+    // Every RSP-restoring sequence must end in a terminator, possibly after
+    // running through fall-through successor blocks. Those successors are
+    // pinned adjacent so the epilogue bytes stay contiguous for the unwinder.
+    let mut pins = BTreeSet::new();
+    let epilogue_end = |last: &Instr, f: &Function, pe: &PeLayout, boundaries: &BTreeSet<u32>| {
+        last.iced.mnemonic() == Mnemonic::Ret
+            || import_tail(&last.iced, pe)
+            // Shared epilogues and funclet exits end in a jump: local targets
+            // and resolved indirect dispatches are remapped, and any other
+            // target is reached through a retargetable near-form branch
+            // (entry trampolines stay, interiors are rewritten by the commit
+            // phase).
+            || (matches!(
+                last.iced.flow_control(),
+                FlowControl::UnconditionalBranch
+                    | FlowControl::IndirectBranch
+                    | FlowControl::ConditionalBranch
+            ) && (last
+                .branch_target_rva(pe.image_base)
+                .is_some_and(|t| boundaries.contains(&t))
+                || f.resolved_indirect.contains_key(&last.rva)
+                || f.jump_tables.iter().any(|t| t.branch == last.rva)
+                || Analysis::retargetable(last)))
+    };
+    for &(block_index, start) in &rsp_writes {
+        let mut ok = false;
+        let mut current = block_index;
+        let mut cursor = start;
+        for _ in 0..16 {
+            let block = &f.blocks[current];
+            let suffix = &block.instrs[cursor..];
+            let Some(last) = suffix.last() else {
+                break;
+            };
+            for (j, item) in suffix[..suffix.len() - 1].iter().enumerate() {
+                let pop = item.iced.mnemonic() == Mnemonic::Pop
+                    && item.iced.op0_register().is_gpr64();
+                let restore = (j == 0
+                    && matches!(item.iced.mnemonic(), Mnemonic::Add | Mnemonic::Lea | Mnemonic::Mov)
+                    && item.iced.op0_register() == Register::RSP
+                    && (item.iced.mnemonic() != Mnemonic::Mov
+                        || item.iced.op1_kind() == iced_x86::OpKind::Register))
+                    || (j > 0
+                        && item.iced.mnemonic() == Mnemonic::Mov
+                        && item.iced.op0_register() == Register::RSP);
+                if !pop && !restore {
+                    return Err("unsupported stack restoration");
+                }
+            }
+            if epilogue_end(last, f, pe, &boundaries) {
+                ok = true;
+                break;
+            }
+            if last.falls_through() && current + 1 < f.blocks.len() {
+                pins.insert(f.blocks[current + 1].start_rva);
+                current += 1;
+                cursor = 0;
+            } else {
+                break;
+            }
+        }
+        if !ok {
+            return Err("unsupported stack restoration");
+        }
     }
-    Ok(())
+    // Fall-through is fully supported: interior fall-throughs become natural
+    // flow or synthetic jumps, and a fall-through past the function extent
+    // jumps back to the original successor address in encode_function. A live
+    // fall-through into trimmed padding is impossible: the reachability
+    // analysis marks every fall-through successor as live.
+    Ok(pins)
 }
 
 pub fn run(
@@ -458,24 +573,29 @@ pub fn run_with_segments(
     let mut continuation_updates = BTreeMap::new();
     let mut global_map = BTreeMap::new();
     for (index, f) in analysis.functions.iter().enumerate() {
-        let eligibility = eligible(analysis, layout, f, index, segments.is_some()).and_then(|()| {
+        let stale_ok = plan.retains_original_bodies();
+        let eligibility = eligible(analysis, layout, f, index, segments.is_some(), stale_ok).and_then(|pins| {
             if address_taken
                 .range(f.start_rva + 1..f.end_rva)
-                .next()
-                .is_some()
+                .any(|target| !stale_ok || *target < f.start_rva + 5)
             {
                 Err("interior address taken")
             } else {
-                Ok(())
+                Ok(pins)
             }
         });
-        if let Err(reason) = eligibility {
-            *c.skipped_reasons.entry(reason).or_default() += 1;
-            continue;
-        }
+        let pins = match eligibility {
+            Ok(pins) => pins,
+            Err(reason) => {
+                *c.skipped_reasons.entry(reason).or_default() += 1;
+                continue;
+            }
+        };
         c.candidates += 1;
-        let shuffle = rng.gen::<f64>() < probability && f.blocks.len() >= 3;
         let mut expanded = f.clone();
+        expanded.trim_dead_tail();
+        let block_count = expanded.blocks.len();
+        let shuffle = rng.gen::<f64>() < probability && block_count >= 3;
         let mut prefixed = 0;
         if let Some(cfg) = segments {
             let prologue_end = layout.unwind_info(f.start_rva).unwrap().prologue_end;
@@ -506,12 +626,64 @@ pub fn run_with_segments(
             .rva
             .checked_add(offset)
             .context("relayout RVA overflow")?;
-        let mut order: Vec<_> = (0..f.blocks.len()).collect();
+        let mut order: Vec<_> = (0..block_count).collect();
         if shuffle {
-            order[1..].shuffle(rng);
-            if order.iter().enumerate().all(|(i, &b)| i == b) {
-                order.swap(1, 2);
+            // Adjacency constraints: blocks the prologue spans, and blocks an
+            // epilogue continues into, must stay adjacent and in their original
+            // relative order. The shuffle permutes whole constraint groups.
+            let prologue_end = layout.unwind_info(f.start_rva).unwrap().prologue_end;
+            let lead = expanded
+                .blocks
+                .iter()
+                .take_while(|b| b.end_rva < prologue_end)
+                .count()
+                + 1;
+            let mut next_pin = vec![false; block_count];
+            for k in 0..lead.saturating_sub(1) {
+                next_pin[k] = true;
             }
+            for start in &pins {
+                if let Some(k) = expanded
+                    .blocks
+                    .iter()
+                    .position(|b| &b.start_rva == start)
+                {
+                    if k > 0 {
+                        next_pin[k - 1] = true;
+                    }
+                }
+            }
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            let mut current: Vec<usize> = Vec::new();
+            for k in 0..block_count {
+                current.push(k);
+                if !(k + 1 < block_count && next_pin[k]) {
+                    groups.push(std::mem::take(&mut current));
+                }
+            }
+            let first = groups
+                .iter()
+                .position(|g| g.contains(&0))
+                .context("entry block group")?;
+            groups.swap(0, first);
+            let mut shuffled: Vec<usize> = groups[0].clone();
+            let mut tail: Vec<Vec<usize>> = groups[1..].to_vec();
+            tail.shuffle(rng);
+            let tail_len = tail.len();
+            for group in tail {
+                shuffled.extend(group);
+            }
+            if shuffled.iter().enumerate().all(|(i, &b)| i == b) && tail_len > 1 {
+                // Reproduce a change: swap two constraint groups, which keeps
+                // every adjacency intact.
+                shuffled = groups[0].clone();
+                let mut tail: Vec<Vec<usize>> = groups[1..].to_vec();
+                tail.swap(0, 1);
+                for group in tail {
+                    shuffled.extend(group);
+                }
+            }
+            order = shuffled;
         }
         let Ok(encoded) = encode_function(&expanded, layout.va(rva), &order, &pe.data) else {
             c.reverted += 1;
@@ -519,7 +691,63 @@ pub fn run_with_segments(
         };
         let info = layout.unwind_info(f.start_rva).unwrap();
         let prologue_len = (info.prologue_end - f.start_rva) as usize;
-        if encoded.code.get(..prologue_len) != Some(&pe.data[f.off..f.off + prologue_len]) {
+        // The prologue must keep instruction boundaries and register-saving
+        // effects so unwind code offsets stay valid. Bytes may differ only
+        // when an instruction is re-encoded at the same length while resolving
+        // to the same target: RIP-relative operands (e.g. the /GS security
+        // cookie load), and branches or calls whose target is unchanged or
+        // remapped to the relocated copy of the target block.
+        let prologue_ok = (|| {
+            let mut pos = 0usize;
+            while pos < prologue_len {
+                let copy = Decoder::with_ip(
+                    64,
+                    &encoded.code[pos..],
+                    layout.va(rva) + pos as u64,
+                    DecoderOptions::NONE,
+                )
+                .decode();
+                if copy.is_invalid() {
+                    return false;
+                }
+                let orig = Decoder::with_ip(
+                    64,
+                    &pe.data[f.off + pos..],
+                    layout.va(f.start_rva) + pos as u64,
+                    DecoderOptions::NONE,
+                )
+                .decode();
+                if copy.len() != orig.len() {
+                    return false;
+                }
+                let same_bytes = encoded.code[pos..pos + copy.len()]
+                    == pe.data[f.off + pos..f.off + pos + copy.len()];
+                let relocates_target = |resolved: u64| {
+                    encoded
+                        .address_map
+                        .get(&orig.near_branch_target())
+                        .copied()
+                        .unwrap_or(orig.near_branch_target())
+                        == resolved
+                };
+                let compatible = (copy.is_ip_rel_memory_operand()
+                    && orig.is_ip_rel_memory_operand()
+                    && copy.ip_rel_memory_address() == orig.ip_rel_memory_address())
+                    || (matches!(
+                        orig.flow_control(),
+                        FlowControl::ConditionalBranch
+                            | FlowControl::UnconditionalBranch
+                            | FlowControl::Call
+                    ) && copy.code() == orig.code()
+                        && relocates_target(copy.near_branch_target()));
+                if !same_bytes && !compatible {
+                    return false;
+                }
+                pos += copy.len();
+            }
+            true
+        })();
+        if !prologue_ok {
             c.reverted += 1;
             continue;
         }
@@ -620,13 +848,25 @@ pub fn run_with_segments(
             let crate::pe::UnwindKind::Handler { handler_rva, .. } = info.kind else {
                 bail!("GS data without handler");
             };
-            exception_bytes = prefix;
+            exception_bytes = prefix.clone();
             exception_bytes.extend_from_slice(&handler_rva.to_le_bytes());
             exception_bytes.extend_from_slice(gs);
             unwind_rva = plan
                 .rva
                 .checked_add(unwind_offset)
                 .context("GS unwind RVA overflow")?;
+        }
+        if let Some(opaque) = layout.opaque_handlers.get(&f.start_rva) {
+            let crate::pe::UnwindKind::Handler { handler_rva, .. } = info.kind else {
+                bail!("opaque handler data without handler");
+            };
+            exception_bytes = prefix.clone();
+            exception_bytes.extend_from_slice(&handler_rva.to_le_bytes());
+            exception_bytes.extend_from_slice(opaque);
+            unwind_rva = plan
+                .rva
+                .checked_add(unwind_offset)
+                .context("opaque unwind RVA overflow")?;
         }
         if !exception_bytes.is_empty() {
             generated_unwind.insert(unwind_rva);
@@ -705,6 +945,81 @@ pub fn run_with_segments(
                         Decoder::with_ip(64, &bytes, new_source, DecoderOptions::NONE).decode();
                     if decoded.is_invalid() || decoded.ip_rel_memory_address() != new_target {
                         bail!("invalid interior code-address fixup");
+                    }
+                    payload[at..at + bytes.len()].copy_from_slice(&bytes);
+                }
+            }
+        }
+        // Foreign direct branches and calls into relocated interiors get the
+        // same treatment: the displacement is rewritten to the new address in
+        // both the original bytes and the relocated copy of the source.
+        for (&old_target, sources) in &analysis.branch_sources {
+            if layout
+                .runtime_functions
+                .iter()
+                .any(|f| f.start == old_target)
+            {
+                continue;
+            }
+            let Some(&new_target) = global_map.get(&layout.va(old_target)) else {
+                continue;
+            };
+            // Branches inside the relocated function itself are remapped by
+            // the encoder; only foreign sources need patching here.
+            let owner_fn = analysis
+                .functions
+                .iter()
+                .position(|f| f.start_rva <= old_target && old_target < f.end_rva);
+            for (owner, source) in sources {
+                if Some(*owner) == owner_fn {
+                    continue;
+                }
+                // Short-form or pinned foreign edges keep pointing at the
+                // retained original bytes instead of being re-encoded.
+                if !Analysis::retargetable(source) {
+                    continue;
+                }
+                let mut patched = source.iced;
+                patched.set_near_branch64(new_target);
+                let original = match super::encode_exact(&patched, source.iced.ip(), source.len) {
+                    Some(bytes) => bytes,
+                    None => {
+                        if std::env::var("SIGBREAKER_DEBUG").is_ok() {
+                            eprintln!(
+                                "retarget fail: rva {:#x} off {:#x} len {} code {:?} flow {:?} target {new_target:#x} ip {:#x}",
+                                source.rva,
+                                source.off,
+                                source.len,
+                                source.iced.code(),
+                                source.iced.flow_control(),
+                                source.iced.ip()
+                            );
+                            eprintln!(
+                                "  target rva {:#x} runtime-start? {} sources {:?}",
+                                old_target,
+                                layout.runtime_functions.iter().any(|f| f.start == old_target),
+                                analysis.branch_sources.get(&old_target).map(|s| s.len())
+                            );
+                        }
+                        bail!("cannot retarget foreign branch");
+                    }
+                };
+                if !patches.iter().any(|(at, bytes)| {
+                    *at < source.off + source.len && source.off < at + bytes.len()
+                }) {
+                    metadata_patches.push((source.off, original));
+                }
+                if let Some(&new_source) = global_map.get(&source.iced.ip()) {
+                    let at = usize::try_from(new_source - layout.va(plan.rva))?;
+                    let actual =
+                        Decoder::with_ip(64, &payload[at..], new_source, DecoderOptions::NONE)
+                            .decode();
+                    let bytes = super::encode_exact(&patched, new_source, actual.len())
+                        .context("cannot retarget relocated foreign branch")?;
+                    let decoded =
+                        Decoder::with_ip(64, &bytes, new_source, DecoderOptions::NONE).decode();
+                    if decoded.is_invalid() || decoded.near_branch_target() != new_target {
+                        bail!("invalid foreign branch retarget");
                     }
                     payload[at..at + bytes.len()].copy_from_slice(&bytes);
                 }

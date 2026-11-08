@@ -28,6 +28,9 @@ pub struct Instr {
     pub len: usize,
     /// Overlaps a base-relocation fixup: bytes must not be rewritten.
     pub pinned: bool,
+    /// Not reachable from the function entry through decoded edges. Dead
+    /// instructions may only trail the live code (padding or data islands).
+    pub dead: bool,
     /// The decoded instruction.
     pub iced: Instruction,
 }
@@ -115,6 +118,22 @@ pub struct Function {
     pub jump_tables: Vec<crate::indirect::JumpTable>,
 }
 
+impl Function {
+    /// Drops trailing dead instructions (padding after the last live one).
+    pub fn trim_dead_tail(&mut self) {
+        while let Some(block) = self.blocks.last_mut() {
+            while block.instrs.last().is_some_and(|i| i.dead) {
+                block.instrs.pop();
+            }
+            if block.instrs.is_empty() {
+                self.blocks.pop();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 /// The result of lifting every executable section.
 #[derive(Debug)]
 pub struct Analysis {
@@ -124,8 +143,14 @@ pub struct Analysis {
     branch_owners: BTreeMap<u32, Vec<usize>>,
     /// Direct call targets and known code-address references that must stay fixed.
     call_targets: BTreeSet<u32>,
+    /// Targets referenced as data (non-`lea` RIP-relative reads, data-section
+    /// pointers, relocation fixups). These can never be retargeted.
+    data_refs: BTreeSet<u32>,
     /// Typed code-address materializations that can be rewritten after layout.
     pub address_references: BTreeMap<u32, Vec<Instr>>,
+    /// Direct branch/call sources per target: `(owning region, instruction)`.
+    /// Foreign edges into a relocated interior are rewritten to the new target.
+    pub branch_sources: BTreeMap<u32, Vec<(usize, Instr)>>,
 }
 
 impl Analysis {
@@ -134,6 +159,8 @@ impl Analysis {
         let mut functions = Vec::new();
         let mut branch_owners: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
         let mut call_targets = BTreeSet::new();
+        let mut data_refs = BTreeSet::new();
+        let mut branch_sources = BTreeMap::<u32, Vec<(usize, Instr)>>::new();
         let mut address_references = BTreeMap::<u32, Vec<Instr>>::new();
         call_targets.extend(pe.code_roots.iter().copied());
         let roots = if pe.runtime_functions.is_empty() {
@@ -161,23 +188,37 @@ impl Analysis {
                             .and_then(|v| u32::try_from(v).ok())
                         {
                             if pe.executable_sections().any(|s| s.contains_rva(rva)) {
-                                if ins.iced.mnemonic() == iced_x86::Mnemonic::Lea
-                                    && crate::indirect::direct_address_use(&func, ins.rva)
-                                {
-                                    address_references.entry(rva).or_default().push(ins.clone());
-                                } else {
-                                    call_targets.insert(rva);
+                                if ins.iced.mnemonic() == iced_x86::Mnemonic::Lea {
                                     if pe.runtime_functions.iter().any(|f| f.start == rva) {
-                                        call_targets.insert(rva + 1);
+                                        // A materialized function entry: the
+                                        // entry keeps its trampoline, so the
+                                        // value stays valid without rewriting.
+                                        continue;
                                     }
+                                    if crate::indirect::direct_address_use(&func, ins.rva) {
+                                        address_references.entry(rva).or_default().push(ins.clone());
+                                        continue;
+                                    }
+                                }
+                                call_targets.insert(rva);
+                                data_refs.insert(rva);
+                                if pe.runtime_functions.iter().any(|f| f.start == rva) {
+                                    call_targets.insert(rva + 1);
+                                    data_refs.insert(rva + 1);
                                 }
                             }
                         }
                     }
                     if ins.iced.is_call_near() {
-                        call_targets.insert(
-                            ins.iced.near_branch_target().wrapping_sub(pe.image_base) as u32,
-                        );
+                        let target =
+                            ins.iced.near_branch_target().wrapping_sub(pe.image_base) as u32;
+                        call_targets.insert(target);
+                        branch_sources.entry(target).or_default().push((f_idx, ins.clone()));
+                    }
+                    if ins.is_direct_branch() {
+                        if let Some(target) = ins.branch_target_rva(pe.image_base) {
+                            branch_sources.entry(target).or_default().push((f_idx, ins.clone()));
+                        }
                     }
                 }
                 functions.push(func);
@@ -188,13 +229,19 @@ impl Analysis {
             .iter()
             .flat_map(|f| f.jump_tables.iter().map(|t| t.bytes.clone()))
             .collect();
-        call_targets.extend(pe.relocated_code_references_except(data, &table_bytes));
-        call_targets.extend(pe.data_code_references_except(data, &table_bytes));
+        let relocated: BTreeSet<_> = pe.relocated_code_references_except(data, &table_bytes);
+        call_targets.extend(relocated.iter().copied());
+        data_refs.extend(relocated);
+        let data_based: BTreeSet<_> = pe.data_code_references_except(data, &table_bytes);
+        call_targets.extend(data_based.iter().copied());
+        data_refs.extend(data_based);
         Ok(Analysis {
             functions,
             branch_owners,
             call_targets,
+            data_refs,
             address_references,
+            branch_sources,
         })
     }
 
@@ -229,6 +276,117 @@ impl Analysis {
             .range(range.clone())
             .any(|(_, owners)| owners.iter().any(|&owner| owner != f_idx))
             || self.call_targets.range(range).next().is_some()
+    }
+
+    /// Whether every foreign code edge into `range` can be retargeted after
+    /// the containing region moves. Data references and edges from another
+    /// region that cannot be re-encoded (short forms, relocation-protected or
+    /// dead source instructions) keep the range pinned.
+    ///
+    /// With `stale_ok` (layouts that retain original bodies) interior
+    /// references stay valid pointing at the unchanged original bytes, so only
+    /// the entry trampoline region must stay clean.
+    pub fn interior_movable(
+        &self,
+        f_idx: usize,
+        range: Range<u32>,
+        stale_ok: bool,
+    ) -> bool {
+        if range.start >= range.end {
+            return true;
+        }
+        if stale_ok {
+            // The relocated entry becomes a 5-byte jump; any reference into
+            // those bytes would execute garbage. References deeper into the
+            // function stay valid pointing at the retained original bytes.
+            // Foreign edges into the trampoline interior must be re-encodable
+            // so the commit phase can rewrite them to the relocated copy;
+            // shorter edges keep the function pinned. The entry itself stays
+            // reachable through the trampoline, so it is not part of the
+            // guarded span.
+            let trampoline = range.start..range.start + 4;
+            for &target in self.call_targets.range(trampoline.clone()) {
+                if self.data_refs.contains(&target) {
+                    return false;
+                }
+                match self.branch_sources.get(&target) {
+                    Some(sources) => {
+                        if sources
+                            .iter()
+                            .any(|(owner, s)| *owner != f_idx && !Self::retargetable(s))
+                        {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            for (&target, owners) in self.branch_owners.range(trampoline) {
+                if owners.iter().all(|&owner| owner == f_idx) {
+                    continue;
+                }
+                if self.call_targets.contains(&target) {
+                    continue;
+                }
+                match self.branch_sources.get(&target) {
+                    Some(sources) => {
+                        if sources
+                            .iter()
+                            .any(|(owner, s)| *owner != f_idx && !Self::retargetable(s))
+                        {
+                            return false;
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            return true;
+        }
+        let blocked = |sources: &[(usize, Instr)]| {
+            sources
+                .iter()
+                .any(|(owner, s)| *owner != f_idx && !Self::retargetable(s))
+        };
+        for &target in self.call_targets.range(range.clone()) {
+            if self.data_refs.contains(&target) {
+                return false;
+            }
+            match self.branch_sources.get(&target) {
+                Some(sources) => {
+                    if blocked(sources) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        for (&target, owners) in self.branch_owners.range(range.clone()) {
+            if owners.iter().all(|&owner| owner == f_idx) {
+                continue;
+            }
+            if self.call_targets.contains(&target) {
+                continue;
+            }
+            match self.branch_sources.get(&target) {
+                Some(sources) => {
+                    if blocked(sources) {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Whether a foreign edge's source instruction can be re-encoded to reach
+    /// an appended layout: near-form branches and calls with room for a rel32.
+    pub fn retargetable(source: &Instr) -> bool {
+        !source.pinned
+            && source.len >= 5
+            && ((source.iced.is_jcc_short_or_near() && source.len == 6)
+                || (source.iced.is_jmp_short_or_near() && source.len == 5)
+                || (source.iced.is_call_near() && source.len == 5))
     }
 
     /// Metadata extents or discovered roots, expressed as section-relative RVAs.
@@ -307,6 +465,7 @@ impl Analysis {
                 rva,
                 len: iced.len(),
                 pinned: false,
+                dead: false,
                 iced,
             };
             if let Some(target) = ins.branch_target_rva(pe.image_base) {
@@ -368,6 +527,7 @@ impl Analysis {
                 rva: sec.virtual_address + (cur - sec.raw_ptr as usize) as u32,
                 len,
                 pinned,
+                dead: false,
                 iced: ins,
             });
             cur += len;
@@ -458,6 +618,7 @@ impl Analysis {
             }
             for (i, ins) in instrs.iter_mut().enumerate() {
                 ins.pinned |= ambiguous || !reached.contains(&i);
+                ins.dead = !ambiguous && !reached.contains(&i);
             }
         }
         // Keep only the prefix that decoded cleanly. Trailing undecodable
