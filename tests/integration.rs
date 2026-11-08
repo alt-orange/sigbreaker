@@ -186,9 +186,10 @@ fn defaults_enable_full_coverage_and_growth_can_be_disabled() {
         (
             defaults.seg_prob,
             defaults.reorder_prob,
-            defaults.shuffle_prob
+            defaults.shuffle_prob,
+            defaults.alias_prob
         ),
-        (1.0, 1.0, 1.0)
+        (1.0, 1.0, 1.0, 1.0)
     );
     let report = pipeline::run(&defaults).unwrap();
     let default_bytes = std::fs::read(out_path(&exe.path)).unwrap();
@@ -211,7 +212,9 @@ fn defaults_enable_full_coverage_and_growth_can_be_disabled() {
         vec!["--grow-segments", "--no-grow-segments"],
         vec!["--no-seg-inject"],
     ] {
-        let mut args = vec!["--no-shuffle", "--no-reorder"];
+        // Default-on passes must all be off for the function to stay
+        // byte-identical; each case then isolates one disable switch.
+        let mut args = vec!["--no-shuffle", "--no-reorder", "--no-alias"];
         args.extend(flags);
         let report = pipeline::run(&exe.cli(&args)).unwrap();
         assert!(

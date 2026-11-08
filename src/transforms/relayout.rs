@@ -648,13 +648,24 @@ fn eligible(
     Ok(pins)
 }
 
+/// Behavior switches for the relocation pass beyond plain block shuffling.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// Probability [0, 1] of padding each unreachable gap with inert filler.
+    pub junk_probability: f64,
+    /// Scrub proven-clean retained original bodies behind their trampolines.
+    pub wipe_original: bool,
+    /// Probability [0, 1] of aliasing each relocated instruction's opcode.
+    pub alias_probability: f64,
+}
+
 pub fn run(
     analysis: &Analysis,
     pe: &mut PeFile,
     probability: f64,
     rng: &mut impl Rng,
 ) -> Result<Counters> {
-    run_with_segments(analysis, pe, probability, rng, None, 0.0, false)
+    run_with_segments(analysis, pe, probability, rng, None, Options::default())
 }
 
 pub fn run_with_segments(
@@ -663,8 +674,7 @@ pub fn run_with_segments(
     probability: f64,
     rng: &mut impl Rng,
     segments: Option<&super::segment_inject::Config>,
-    junk_probability: f64,
-    wipe_original: bool,
+    options: Options,
 ) -> Result<Counters> {
     let mut c = Counters::default();
     if (probability == 0.0 && segments.is_none()) || pe.layout().runtime_functions.is_empty() {
@@ -705,7 +715,7 @@ pub fn run_with_segments(
     );
     let mut payload = Vec::new();
     let mut entries = Vec::new();
-    let mut generated_unwind = BTreeSet::new();
+    let mut generated_unwind = BTreeMap::new(); // entry begin -> generated unwind RVA
     let mut patches = Vec::new();
     let mut wipes = Vec::new();
     let mut wiped_ranges = Vec::new();
@@ -736,7 +746,7 @@ pub fn run_with_segments(
         // re-encodable (the commit phase rewrites it) and no data value may
         // point inside. The stale-reference relaxation that lets other
         // functions relocate does not apply here.
-        let can_wipe = wipe_original
+        let can_wipe = options.wipe_original
             && stale_ok
             && analysis.interior_movable(index, f.start_rva + 1..f.end_rva, false)
             && address_taken
@@ -850,18 +860,18 @@ pub fn run_with_segments(
             order = shuffled;
         }
         let info = layout.unwind_info(f.start_rva).unwrap();
-        let junk = (junk_probability > 0.0).then(|| {
+        let junk = (options.junk_probability > 0.0).then(|| {
             (
                 &mut *rng as &mut dyn RngCore,
                 JunkConfig {
-                    probability: junk_probability,
+                    probability: options.junk_probability,
                     // v2 epilogue distances are end-relative (capped at 4095);
                     // mid-body filler is distance-neutral.
                     trailing: info.v2.is_none(),
                 },
             )
         });
-        let encoded = match encode_function(&expanded, layout.va(rva), &order, &pe.data, lead, junk)
+        let mut encoded = match encode_function(&expanded, layout.va(rva), &order, &pe.data, lead, junk)
         {
             Ok(encoded) => encoded,
             Err(_) => {
@@ -1048,7 +1058,7 @@ pub fn run_with_segments(
                 .context("opaque unwind RVA overflow")?;
         }
         if !exception_bytes.is_empty() {
-            generated_unwind.insert(unwind_rva);
+            generated_unwind.insert(rva, unwind_rva);
         }
         patches.push((f.off, jump));
         global_map.extend(encoded.address_map.iter().map(|(&a, &b)| (a, b)));
@@ -1062,6 +1072,23 @@ pub fn run_with_segments(
         entries.push((rva, end, unwind_rva));
         // Inter-function padding is unreachable dead space: random bytes there
         // break end-of-function signatures just like the in-body filler.
+        // Aliasing runs last on the final code buffer: prologue validation
+        // and unwind/v2 relocation already accepted these bytes, and aliasing
+        // only swaps equivalent opcode forms at identical instruction
+        // boundaries, so every downstream consumer (offsets, spans, address
+        // map, wipe extents) stays valid while the byte stream changes.
+        if options.alias_probability > 0.0 {
+            let new_ip = layout.va(rva);
+            for (_, span) in &encoded.spans {
+                let start = (span.start - new_ip) as usize;
+                let end = (span.end - new_ip) as usize;
+                if rng.gen::<f64>() < options.alias_probability
+                    && super::alias_in_place(&mut encoded.code[start..end], span.start)
+                {
+                    c.aliases += 1;
+                }
+            }
+        }
         let pad = payload.len();
         payload.resize(offset as usize, 0);
         rng.fill_bytes(&mut payload[pad..]);
@@ -1302,3 +1329,5 @@ pub fn run_with_segments(
     }
     Ok(c)
 }
+
+

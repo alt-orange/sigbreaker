@@ -10,7 +10,7 @@ use rand::SeedableRng;
 use crate::analysis::Analysis;
 use crate::cli::Cli;
 use crate::pe::PeFile;
-use crate::transforms::{relayout, reorder, segment_inject, shuffle};
+use crate::transforms::{opcode_alias, relayout, reorder, segment_inject, shuffle};
 use crate::verify;
 
 /// Runs SigBreaker end-to-end and returns a human-readable report.
@@ -20,6 +20,7 @@ pub fn run(cli: &Cli) -> Result<String> {
         ("--reorder-prob", cli.reorder_prob),
         ("--shuffle-prob", cli.shuffle_prob),
         ("--junk-prob", cli.junk_prob),
+        ("--alias-prob", cli.alias_prob),
     ] {
         if !(0.0..=1.0).contains(&p) {
             bail!("{name} must be within [0, 1], got {p}");
@@ -124,6 +125,22 @@ pub fn run(cli: &Cli) -> Result<String> {
     // for the verify pass, which checks the structural invariant "the transformed
     // image still decodes to the original instruction count".
     let lifted = Analysis::run(&layout, &pe.data)?;
+    // Pass 3 — opcode aliasing, in place. Runs after reordering so it is the
+    // last writer of the in-place bytes.
+    if !cli.no_alias && cli.alias_prob > 0.0 {
+        let cfg = opcode_alias::Config {
+            probability: cli.alias_prob,
+        };
+        let c = opcode_alias::run(&lifted, &layout, &mut pe.data, &cfg, &mut rng);
+        pass(
+            "opcode aliasing",
+            "MR/RM direction-bit aliases of register-register ALU/MOV".into(),
+            c,
+        );
+    }
+    // Re-lift again: relocation must see the aliased bytes so its byte-exact
+    // encoding path preserves them and prologue validation stays consistent.
+    let lifted = Analysis::run(&layout, &pe.data)?;
     if !cli.no_verify {
         verify::verify(&layout, &pe.data, &analysis)?;
     }
@@ -145,8 +162,11 @@ pub fn run(cli: &Cli) -> Result<String> {
                 },
                 &mut rng,
                 segments.as_ref(),
-                cli.junk_prob,
-                cli.wipe_original,
+                relayout::Options {
+                    junk_probability: cli.junk_prob,
+                    wipe_original: cli.wipe_original,
+                    alias_probability: if cli.no_alias { 0.0 } else { cli.alias_prob },
+                },
             )?;
             pass(
                 "basic block relocation",

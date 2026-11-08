@@ -23,6 +23,8 @@ pub struct Counters {
     pub instructions_touched: u64,
     /// Inert filler instructions inserted into unreachable gaps.
     pub junk_inserted: u64,
+    /// Instructions rewritten into an equivalent aliased opcode encoding.
+    pub aliases: u64,
     /// Relocated functions whose retained original body was scrubbed.
     pub wiped_original: u64,
     /// Items skipped because they overlap a base-relocation fixup.
@@ -51,6 +53,7 @@ impl Counters {
         push("skipped (unwind/exception metadata)", self.skipped_metadata);
         push("instructions touched", self.instructions_touched);
         push("junk instructions", self.junk_inserted);
+        push("aliased instructions", self.aliases);
         push("original bodies wiped", self.wiped_original);
         push("candidates", self.candidates);
         push("skipped (relocated bytes)", self.skipped_pinned);

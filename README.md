@@ -31,6 +31,7 @@ header-only edits, rejected attempts, and reverted transformations are excluded.
 | Area | Implemented support |
 | --- | --- |
 | Prefix injection | Equal-length encodings and expanded eligible functions; ES/CS/SS/DS by default |
+| Opcode aliasing | Register-register ALU/MOV rewritten between MR and RM direction-bit forms at identical length, decode-verified per instruction |
 | Scheduling | Register/flag dependencies, equal-length scalar runs, proven saved nonvolatile registers and private committed stack slots |
 | Exceptions | Named-import C-specific SEH and C++ FH3/FH4; explicit static CRT/GS identities from linker maps |
 | Unwind | Version 1, supported secondary chains with pinned primaries, version-2 explicit epilogue rewriting |
@@ -90,9 +91,11 @@ is distinct from actually relocating its exception-handling functions.
 | `--segments` | `es,cs,ss,ds` | Prefix whitelist |
 | `--reorder-prob` | `1.0` | Scheduling probability |
 | `--shuffle-prob` | `1.0` | Block movement probability |
+| `--alias-prob` | `1.0` | Opcode alias probability |
 | `--no-grow-segments` | off | Restrict prefixes to original lengths |
 | `--no-seg-inject` | off | Disable prefix injection |
 | `--no-reorder` | off | Disable scheduling |
+| `--no-alias` | off | Disable opcode aliasing |
 | `--no-shuffle` | off | Disable block shuffling |
 | `--handler-map` | none | Matching linker map for static handlers |
 | `--no-verify` | off | Disable the in-place decode check |
@@ -120,6 +123,21 @@ The C++ runner additionally requires the exported exception parent to relocate
 before running nested exceptions/destructors. Fixtures cover Rust, MSVC, optional
 Clang, ripgrep, DLL loading, SEH, stack walking, callbacks, switches, and threads.
 Logs, hashes, and generated artifacts remain under `target/`.
+
+### Signature detection
+
+```powershell
+python scripts/signature_test.py ORIGINAL PROCESSED [--prefix 256] [--baseline]
+```
+Builds byte-pattern signatures from every original function (branch and
+rip-relative displacements plus image-range immediates are wildcarded;
+opcodes, registers, and small immediates stay concrete), then reports which
+signatures still match the processed binary. Results are split into two
+variants - entry-anchored (offset 0) and body-anchored (offset 16, past the
+entry trampoline) - and by match location: at the original site, in the
+appended section, or elsewhere (collision). `--baseline` adds the rate at
+which the same signatures match outside their own function in the original
+binary, which contextualizes collisions, especially for short prefixes.
 
 Saved main results can be checked further with `validate_reprocess.py`,
 `validate_exception_layouts.py`, and `report_validation.py`. The fuzz harness uses

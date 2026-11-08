@@ -38,6 +38,7 @@ impl SegmentName {
     long_about = "SigBreaker experimentally diversifies x86-64 PE binaries \
 with transformations intended to preserve behavior:\n\
   - segment selector injection (configurable whitelist, FS/GS off by default)\n\
+  - opcode aliasing of register-register ALU/MOV (MR/RM direction-bit forms)\n\
   - DAG-based instruction reordering inside basic blocks\n\
   - basic block shuffling with explicit control-flow patching\n\n\
 Supported functions grow in .text or an appended section. Existing data RVAs \
@@ -93,6 +94,11 @@ pub struct Cli {
     #[arg(long)]
     pub wipe_original: bool,
 
+    /// Probability [0, 1] of rewriting an eligible register-register ALU/MOV
+    /// instruction into its equivalent reversed-operand opcode form.
+    #[arg(long, default_value_t = 1.0)]
+    pub alias_prob: f64,
+
     /// Disable segment selector injection.
     #[arg(long)]
     pub no_seg_inject: bool,
@@ -108,6 +114,10 @@ pub struct Cli {
     /// Disable instruction reordering.
     #[arg(long)]
     pub no_reorder: bool,
+
+    /// Disable opcode aliasing.
+    #[arg(long)]
+    pub no_alias: bool,
 
     /// Disable basic block shuffling.
     #[arg(long)]

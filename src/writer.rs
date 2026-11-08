@@ -128,7 +128,7 @@ impl SectionPlan {
         code: Vec<u8>,
         entries: &[(u32, u32, u32)],
         patches: &[(usize, Vec<u8>)],
-        generated_unwind: &std::collections::BTreeSet<u32>,
+        generated_unwind: &std::collections::BTreeMap<u32, u32>,
     ) -> Result<()> {
         self.commit_with_metadata(pe, code, entries, patches, generated_unwind, &[], &[])
     }
@@ -138,7 +138,7 @@ impl SectionPlan {
         mut code: Vec<u8>,
         entries: &[(u32, u32, u32)],
         patches: &[(usize, Vec<u8>)],
-        generated_unwind: &std::collections::BTreeSet<u32>,
+        generated_unwind: &std::collections::BTreeMap<u32, u32>,
         metadata_patches: &[(usize, Vec<u8>)],
         wipes: &[(usize, usize)],
     ) -> Result<()> {
@@ -212,7 +212,11 @@ impl SectionPlan {
             table.push((
                 begin,
                 end,
-                if generated_unwind.contains(&unwind) {
+                // A generated unwind RVA can numerically equal a reused old
+                // data-section unwind RVA (the grown .text starts where .rdata
+                // once lived), so provenance is keyed by the owning entry,
+                // not by the RVA value alone.
+                if generated_unwind.get(&begin).copied() == Some(unwind) {
                     unwind
                 } else {
                     layout.rva(unwind)?
@@ -287,7 +291,7 @@ impl SectionPlan {
             .chain(
                 entries
                     .iter()
-                    .filter(|e| !generated_unwind.contains(&e.2))
+                    .filter(|e| generated_unwind.get(&e.0).copied() != Some(e.2))
                     .map(|e| e.2),
             )
             .collect();

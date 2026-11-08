@@ -500,7 +500,7 @@ fn growing_prefixes_expand_dense_memory_instructions_without_shuffling() {
         0
     );
     let count =
-        relayout::run_with_segments(&a, &mut p, 0.0, &mut StdRng::seed_from_u64(42), Some(&cfg), 0.0, false)
+        relayout::run_with_segments(&a, &mut p, 0.0, &mut StdRng::seed_from_u64(42), Some(&cfg), relayout::Options::default())
             .unwrap();
     assert_eq!(count.applied, 1);
     let f = p.layout().runtime_functions.last().unwrap();
@@ -557,8 +557,7 @@ fn growing_prefixes_support_one_and_two_blocks_and_preserve_results() {
             1.0,
             &mut StdRng::seed_from_u64(42),
             Some(&cfg),
-            0.0,
-            false,
+            relayout::Options::default(),
         )
         .unwrap();
         assert_eq!(grown.applied, 1);
@@ -628,7 +627,7 @@ fn rebuilt_text_can_move_data_rvas_and_raw_offsets_without_new_sections() {
         payload,
         &[(start, end, 0x2080)],
         &[(0x400, jump)],
-        &BTreeSet::new(),
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(pe.layout().sections.len(), 3);
@@ -663,5 +662,8 @@ fn rebuilt_text_can_move_data_rvas_and_raw_offsets_without_new_sections() {
     assert_eq!(&pe.data[cert..cert + 8], b"testcert");
     assert!(pe.data[0x405..0x416].iter().all(|b| *b == 0xCC));
 }
+
+
+
 
 
