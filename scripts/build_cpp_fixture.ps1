@@ -25,7 +25,7 @@ $sehExe = Join-Path $output 'native_seh.exe'
 $sehObj = Join-Path $output 'native_seh.obj'
 $chain = Join-Path $workspace 'tests\fixtures\native_chain.asm'
 $chainObj = Join-Path $output 'native_chain.obj'
-$command = 'call "{0}" >nul && ml64 /nologo /c /Fo"{1}" "{2}" && cl /nologo /O2 /MD /guard:cf "{3}" "{1}" /Fo:"{4}" /Fe:"{5}" /link /INCREMENTAL:NO /EXPORT:chained_probe /EXPORT:chained_body /EXPORT:tail_probe' -f $vcvars.FullName, $chainObj, $chain, $seh, $sehObj, $sehExe
+$command = 'call "{0}" >nul && ml64 /nologo /c /Fo"{1}" "{2}" && cl /nologo /O2 /MD /GS- /guard:cf "{3}" "{1}" /Fo:"{4}" /Fe:"{5}" /link /INCREMENTAL:NO /EXPORT:chained_probe /EXPORT:chained_body /EXPORT:tail_probe' -f $vcvars.FullName, $chainObj, $chain, $seh, $sehObj, $sehExe
 & $env:ComSpec /d /c $command
 if ($LASTEXITCODE -ne 0) { throw 'SEH fixture compilation failed' }
 Write-Output $sehExe

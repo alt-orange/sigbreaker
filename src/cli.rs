@@ -40,8 +40,9 @@ with transformations intended to preserve behavior:\n\
   - segment selector injection (configurable whitelist, FS/GS off by default)\n\
   - DAG-based instruction reordering inside basic blocks\n\
   - basic block shuffling with explicit control-flow patching\n\n\
-Supported plain-v1 unwind functions can move into an appended code section, \
-with entry trampolines and an updated runtime-function table. Unsupported \
+Supported functions are rebuilt in the existing .text section, which can grow; \
+no code section is added. Standard PE references are rebased when needed. Unknown \
+address-bearing metadata can block a rebuild. Unsupported \
 exception formats stay pinned. Structural verification is not a proof of \
 behavioral equivalence."
 )]

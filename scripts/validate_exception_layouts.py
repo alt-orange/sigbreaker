@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
-from pe_fixture_checks import relocated_export
+from pe_fixture_checks import relocated_export, section_names
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('results', type=Path)
@@ -31,12 +31,14 @@ for seed in range(args.seeds):
         (directory / f'{tag}.log').write_bytes(proc.stdout + proc.stderr)
         assert proc.returncode == 0, f'transform failed: {tag}'
         data = output.read_bytes()
+        assert section_names(data) == section_names(source.read_bytes()), 'writer added a section'
         moved = {name: relocated_export(data, name) for name in ('seh_probe', 'seh_nested', 'chained_body', 'tail_probe')}
         assert all(moved.values()), f'missing transformation coverage: {tag}: {moved}'
         assert relocated_export(data, 'chained_probe') is None, 'primary chain region moved'
         for name in ('seh_probe', 'seh_nested'):
-            assert moved[name]['original_unwind_rva'] != moved[name]['relocated_unwind_rva'], 'handler record was not rewritten'
-        assert moved['chained_body']['original_unwind_rva'] == moved['chained_body']['relocated_unwind_rva'], 'chain record must remain fixed'
+            assert moved[name]['original_unwind_rva'] is None, 'retired handler body still has a runtime entry'
+            assert moved[name]['unwind_flags'] & 3, 'rewritten SEH entry lacks handler metadata'
+        assert moved['chained_body']['unwind_flags'] == 4, 'rewritten secondary lacks chain metadata'
         for case, baseline in saved['targets']['native_seh']['baseline'].items():
             run = subprocess.run([str(output), case], capture_output=True, timeout=5, creationflags=flags)
             assert (run.returncode, run.stdout.hex(), run.stderr.hex()) == (baseline['exit'], baseline['stdout'], baseline['stderr']), f'exception behavior mismatch: {tag}/{case}'

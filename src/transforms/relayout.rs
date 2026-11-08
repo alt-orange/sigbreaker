@@ -376,6 +376,7 @@ pub fn run_with_segments(
     );
     let mut payload = Vec::new();
     let mut entries = Vec::new();
+    let mut generated_unwind = BTreeSet::new();
     let mut patches = Vec::new();
     for (index, f) in analysis.functions.iter().enumerate() {
         let eligibility = eligible(analysis, layout, f, index, segments.is_some()).and_then(|()| {
@@ -490,6 +491,9 @@ pub fn run_with_segments(
                 .checked_add(unwind_offset)
                 .context("new unwind RVA overflow")?;
         }
+        if !exception_bytes.is_empty() {
+            generated_unwind.insert(unwind_rva);
+        }
         patches.push((f.off, jump));
         entries.push((rva, end, unwind_rva));
         payload.resize(offset as usize, 0xCC);
@@ -511,7 +515,7 @@ pub fn run_with_segments(
         c.instructions_touched += f.instr_count as u64;
     }
     if !entries.is_empty() {
-        plan.commit(pe, payload, &entries, &patches)?;
+        plan.commit(pe, payload, &entries, &patches, &generated_unwind)?;
     }
     Ok(c)
 }

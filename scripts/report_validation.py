@@ -14,6 +14,7 @@ lines = [
     '# Native validation report', '',
     f"{sum(v['status'] == 'passed' for v in variants)}/{len(variants)} variants passed; "
     f"{sum(bool(c.get('matches_original')) for c in checks)}/{len(checks)} executed cases matched the original.", '',
+    f"{sum(v['status'] == 'unsupported_rebuild' for v in variants)} variants were explicitly rejected by rebuild compatibility checks; these are not counted as passed transformations.", '',
     'Matching requires identical exit code, stdout, and stderr, with no timeout or launch error. '
     'Every active mode must change original executable bytes. Control runs may only update the PE checksum.', '',
     '| Target | Variants passed | Cases matched | Default output growth (bytes) |',
@@ -39,7 +40,7 @@ lines += ['', '## Modes and coverage', '',
 for name, covered in result.get('relocated_stackwalk_coverage', {}).items():
     rows = [row for row in variants if row['target'] == name and row.get('relocated_stackwalk')]
     lines.append(f'- {name}: relocated stack-walk coverage = {covered}; {len(rows)} variants have '
-                 'an exported walk entry jumping into `.sbrk`, a corresponding runtime-function entry, '
+                 'an exported walk entry reaching rewritten code inside `.text`, a corresponding runtime-function entry, '
                  'and runtime results in `results.json`.')
 benchmark_file = directory / 'benchmark.json'
 stress_file = directory / 'exception-layouts.json'
@@ -56,7 +57,7 @@ if reprocess_file.exists():
     reprocessed = json.loads(reprocess_file.read_text(encoding='utf-8'))
     lines += ['', '## Reprocessing', '',
               f"{sum(bool(c['passed']) for c in reprocessed)}/{len(reprocessed)} repeated-processing runtime cases passed. "
-              'Each target was transformed three further times. `reprocess.json` retains the checks; '
+              'Successful supported outputs were transformed three further times. `reprocess.json` retains the checks; '
               'per-pass logs retain transformation reports.']
 if benchmark_file.exists():
     benchmark = json.loads(benchmark_file.read_text(encoding='utf-8'))

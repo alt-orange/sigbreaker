@@ -25,6 +25,7 @@ pub mod dependencies;
 pub mod exception;
 pub mod pe;
 pub mod pipeline;
+pub mod rebuild;
 pub mod stats;
 pub mod transforms;
 pub mod verify;

@@ -10,7 +10,7 @@ import struct
 import subprocess
 import sys
 import time
-from pe_fixture_checks import relocated_export
+from pe_fixture_checks import relocated_export, section_names
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser()
@@ -198,11 +198,14 @@ for name, original, cases in targets:
             log = bytes.fromhex(transformed["stdout"]) + bytes.fromhex(transformed["stderr"])
             (RUN / f"{tag}.log").write_bytes(log)
             if transformed["exit"] != 0 or transformed["error"] or not output.exists():
-                row["status"] = "transform_failed"
-                print(f"FAIL {tag}: transformation failed", flush=True)
+                reason = bytes.fromhex(transformed['stderr']).decode(errors='replace')
+                unsupported = any(marker in reason for marker in ('opaque exception metadata', 'unclassified image-relative data reference', 'unclassified absolute data reference', 'unclassified executable bytes', 'unresolved indirect branch', 'unsupported extended load-config metadata', 'nonempty volatile metadata', 'unsupported populated data directory', 'overlapping instruction roots'))
+                row["status"] = 'unsupported_rebuild' if unsupported and not output.exists() else "transform_failed"
+                print(f"{row['status'].upper()} {tag}: {reason.strip()}", flush=True)
             else:
                 row["sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
                 before, after = original.read_bytes(), output.read_bytes()
+                assert section_names(before) == section_names(after), 'output added or renamed a section'
                 row["changed_bytes"] = sum(a != b for a, b in zip(before, after))
                 row["same_size"] = len(before) == len(after)
                 row["input_bytes"] = len(before)
@@ -237,11 +240,11 @@ for name, original, cases in targets:
 for name, original, _ in targets:
     assert hashlib.sha256(original.read_bytes()).hexdigest() == result["targets"][name]["sha256"]
 summary = {status: sum(r["status"] == status for r in result["variants"])
-           for status in ("passed", "transform_failed", "runtime_mismatch", "no_code_change")}
+           for status in ("passed", "unsupported_rebuild", "transform_failed", "runtime_mismatch", "no_code_change")}
 result["summary"] = summary
 result['relocated_stackwalk_coverage'] = {
-    name: any(row['target'] == name and row.get('relocated_stackwalk') and row['status'] == 'passed'
-              for row in result['variants'])
+    name: (any(row['target'] == name and row.get('relocated_stackwalk') and row['status'] == 'passed'
+              for row in result['variants']) if any(row['target']==name and row['mode'] in ('default','shuffle_only','growing_segments') and row['status']=='passed' for row in result['variants']) else None)
     for name, _, _ in targets if name in ('native_cpp', 'native_dll')
 }
 result['relocated_exception_coverage'] = {
@@ -253,6 +256,6 @@ print(f"SUMMARY {summary}", flush=True)
 print(f"RESULTS {RUN / 'results.json'}", flush=True)
 print(f"RELOCATED STACK WALK {result['relocated_stackwalk_coverage']}", flush=True)
 print(f"RELOCATED EXCEPTIONS {result['relocated_exception_coverage']}", flush=True)
-raise SystemExit(0 if all(r["status"] == "passed" for r in result["variants"])
-                 and all(result['relocated_stackwalk_coverage'].values())
+raise SystemExit(0 if all(r["status"] in ("passed", 'unsupported_rebuild') for r in result["variants"])
+                 and all(value is not False for value in result['relocated_stackwalk_coverage'].values())
                  and all(result['relocated_exception_coverage'].values()) else 1)

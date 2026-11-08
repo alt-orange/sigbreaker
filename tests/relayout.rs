@@ -4,6 +4,7 @@ use common::TestPe;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
 use rand::{rngs::StdRng, SeedableRng};
 use sigbraker::{analysis::Analysis, pe::PeFile, transforms::relayout};
+use std::collections::BTreeSet;
 
 fn fixture() -> PeFile {
     let code = [
@@ -120,7 +121,8 @@ fn expanded_layout_is_deterministic_and_preserves_overlay() {
         assert_eq!(c.applied, 1);
     }
     assert_eq!(first.data, second.data);
-    assert_eq!(&first.data[overlay..overlay + 17], b"test overlay data");
+    assert_eq!(&first.data[first.data.len() - 17..], b"test overlay data");
+    assert!(first.data.len() - 17 > overlay);
 }
 
 // Tiny semantic oracle for this fixture. It follows generated control flow,
@@ -163,9 +165,12 @@ fn expanded_layout_preserves_both_paths_and_publishes_unwind_entries() {
     let c = relayout::run(&a, &mut p, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
     assert_eq!(c.applied, 1);
     assert!(p.data.len() > original.len());
-    assert_eq!(p.layout().runtime_functions.len(), 2);
-    assert_eq!(p.layout().sections.last().unwrap().name(), ".sbrk");
-    assert_eq!(&p.data[0x405..original.len()], &original[0x405..]);
+    assert_eq!(p.layout().runtime_functions.len(), 1);
+    assert_eq!(p.layout().sections.len(), 3);
+    assert_eq!(p.layout().sections[0].name(), ".text");
+    assert!(p.layout().sections[0].raw_size > 0x200);
+    assert!(p.data[0x405..0x410].iter().all(|b| *b == 0xCC));
+    assert_ne!(&p.data[0x400..0x410], &original[0x400..0x410]);
     assert_eq!(evaluate(&p, false), 1);
     assert_eq!(evaluate(&p, true), 2);
     let new = p.layout().runtime_functions.last().unwrap();
@@ -184,19 +189,19 @@ fn planner_inserts_fallthrough_jump_and_rejects_duplicate_blocks() {
 }
 
 #[test]
-fn insufficient_header_room_does_not_mutate_input() {
+fn occupied_header_slot_and_overlay_are_preserved() {
     let mut p = fixture();
-    p.data[0x1C0..0x1E8].fill(0xA5); // next section-header slot is occupied
-    p.data
-        .extend_from_slice(b"overlay prevents safe final-section extension");
-    let snapshot = p.data.clone();
+    p.data[0x1C0..0x1E8].fill(0xA5);
+    p.data.extend_from_slice(b"overlay survives text growth");
     let a = Analysis::run(p.layout(), &p.data).unwrap();
-    assert!(relayout::run(&a, &mut p, 1.0, &mut StdRng::seed_from_u64(42)).is_err());
-    assert_eq!(p.data, snapshot);
+    let c = relayout::run(&a, &mut p, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+    assert_eq!(c.applied, 1);
+    assert!(p.data[0x1C0..0x1E8].iter().all(|b| *b == 0xA5));
+    assert!(p.data.ends_with(b"overlay survives text growth"));
 }
 
 #[test]
-fn no_header_slot_extends_final_section_without_shifting_original_bytes() {
+fn text_grows_without_a_new_header_or_executable_section() {
     let mut p = fixture();
     p.data[0x1C0..0x1E8].fill(0xA5);
     let original = p.data.clone();
@@ -204,10 +209,11 @@ fn no_header_slot_extends_final_section_without_shifting_original_bytes() {
     let c = relayout::run(&a, &mut p, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
     assert_eq!(c.applied, 1);
     assert_eq!(p.layout().sections.len(), 3);
-    assert_eq!(&p.data[0x405..original.len()], &original[0x405..]);
+    assert!(p.data[0x405..0x410].iter().all(|b| *b == 0xCC));
+    assert_ne!(&p.data[0x400..0x410], &original[0x400..0x410]);
     assert_eq!(evaluate(&p, true), 2);
     assert_eq!(evaluate(&p, false), 1);
-    assert!(p.layout().sections.last().unwrap().is_executable());
+    assert!(!p.layout().sections.last().unwrap().is_executable());
 }
 
 #[test]
@@ -220,7 +226,15 @@ fn reprocessing_preserves_entry_chain_and_behavior() {
         assert_eq!(evaluate(&p, true), 2);
         assert_eq!(evaluate(&p, false), 1);
     }
-    assert!(p.layout().sections.iter().any(|s| s.name() == ".sbrk1"));
+    assert_eq!(p.layout().sections.len(), 3);
+    assert_eq!(
+        p.layout()
+            .sections
+            .iter()
+            .filter(|s| s.is_executable())
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -338,4 +352,70 @@ fn growing_prefixes_support_one_and_two_blocks_and_preserve_results() {
             assert_eq!(eax, value.wrapping_mul(2));
         }
     }
+}
+
+#[test]
+fn rebuilt_text_can_move_data_rvas_and_raw_offsets_without_new_sections() {
+    let source = fixture_code(&[
+        0x8B, 0x05, 0xFA, 0x0F, 0, 0, 0x85, 0xC9, 0x74, 6, 0xB8, 1, 0, 0, 0, 0xC3, 0xB8, 2, 0, 0,
+        0, 0xC3,
+    ]);
+    let mut data = source.data;
+    data[0xC08..0xC0A].copy_from_slice(&0xA010u16.to_le_bytes());
+    data[0x810..0x818].copy_from_slice(&0x140002020u64.to_le_bytes());
+    let certificate = data.len() as u32;
+    data[0xE8..0xEC].copy_from_slice(&certificate.to_le_bytes());
+    data[0xEC..0xF0].copy_from_slice(&8u32.to_le_bytes());
+    data.extend_from_slice(b"testcert");
+    let mut pe = PeFile::parse(data).unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    let plan = sigbraker::writer::SectionPlan::new(&pe).unwrap();
+    let start = plan.rva;
+    let encoded =
+        relayout::encode_function(&a.functions[0], pe.layout().va(start), &[0, 2, 1], &pe.data)
+            .unwrap();
+    let end = start + encoded.code.len() as u32;
+    let mut payload = encoded.code;
+    payload.resize(0x2000, 0); // .text grows beyond its old virtual allocation
+    let mut jump = vec![0xE9];
+    jump.extend_from_slice(&((start as i64 - 0x1005) as i32).to_le_bytes());
+    plan.commit(
+        &mut pe,
+        payload,
+        &[(start, end, 0x2080)],
+        &[(0x400, jump)],
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    assert_eq!(pe.layout().sections.len(), 3);
+    let rdata = pe
+        .layout()
+        .sections
+        .iter()
+        .find(|s| s.name() == ".rdata")
+        .unwrap();
+    assert!(rdata.virtual_address > 0x2000);
+    assert!(rdata.raw_ptr > 0x800);
+    let delta = rdata.virtual_address - 0x2000;
+    let load = pe.layout().rva_to_offset(start).unwrap();
+    let instruction = Decoder::with_ip(
+        64,
+        &pe.data[load..],
+        pe.layout().va(start),
+        DecoderOptions::NONE,
+    )
+    .decode();
+    assert_eq!(
+        instruction.ip_rel_memory_address(),
+        pe.layout().va(0x2000 + delta)
+    );
+    assert_eq!(pe.layout().unwind_info(start).unwrap().rva, 0x2080 + delta);
+    let slot = pe.layout().rva_to_offset(0x2010 + delta).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(pe.data[slot..slot + 8].try_into().unwrap()),
+        pe.layout().va(0x2020 + delta)
+    );
+    let cert = u32::from_le_bytes(pe.data[0xE8..0xEC].try_into().unwrap()) as usize;
+    assert_eq!(&pe.data[cert..cert + 8], b"testcert");
+    assert!(pe.data[0x405..0x416].iter().all(|b| *b == 0xCC));
 }

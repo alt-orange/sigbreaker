@@ -31,12 +31,23 @@ def relocated_export(data, export_name):
         if data[at] != 0xE9:
             return None
         target = rva + 5 + struct.unpack_from('<i', data, at + 1)[0]
-        if not any(name == b'.sbrk' and base <= target < base + size for name, size, base, _, _ in sections):
+        if not any(name == b'.text' and base <= target < base + size for name, size, base, _, _ in sections):
             return None
         runtime, size = struct.unpack_from('<II', data, opt + 112 + 3 * 8)
         entries = [struct.unpack_from('<III', data, offset(runtime) + index) for index in range(0, size, 12)]
         moved = next((entry for entry in entries if entry[0] == target), None)
         original = next((entry for entry in entries if entry[0] == rva), None)
-        assert moved and original, 'relocated export lacks runtime-function entry'
-        return {'entry_rva': rva, 'relocated_rva': target, 'original_unwind_rva': original[2], 'relocated_unwind_rva': moved[2]}
+        assert moved, 'rewritten export lacks runtime-function entry'
+        unwind_at = offset(moved[2])
+        flags = data[unwind_at] >> 3
+        return {'entry_rva': rva, 'relocated_rva': target, 'original_unwind_rva': original[2] if original else None,
+                'relocated_unwind_rva': moved[2], 'unwind_flags': flags,
+                'code_begin': moved[0], 'code_end': moved[1]}
+
+
+def section_names(data):
+    pe = struct.unpack_from('<I', data, 0x3C)[0]
+    count = struct.unpack_from('<H', data, pe + 6)[0]
+    table = pe + 24 + struct.unpack_from('<H', data, pe + 20)[0]
+    return [data[table + i * 40:table + i * 40 + 8] for i in range(count)]
     raise AssertionError(f'Missing fixture export: {export_name}')

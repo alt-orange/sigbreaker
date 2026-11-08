@@ -1,5 +1,5 @@
-//! Append-only PE section writer. Existing section offsets and overlays stay fixed.
-use crate::pe::{PeFile, SectionHeader};
+//! Rebuild .text with generated code; preserve the original section set.
+use crate::pe::PeFile;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,228 +66,228 @@ fn put(data: &mut [u8], at: usize, value: u32) {
 
 pub struct SectionPlan {
     pub rva: u32,
-    raw: u32,
-    header: usize,
     opt: usize,
-    coff: usize,
-    section_alignment: u32,
-    file_alignment: u32,
-    extend: Option<SectionHeader>,
-    name: [u8; 8],
 }
-
 impl SectionPlan {
     pub fn new(pe: &PeFile) -> Result<Self> {
-        let coff = u32_at(&pe.data, 0x3C)? as usize + 4;
-        let opt = coff + 20;
-        let optional_size = u16::from_le_bytes(pe.data[coff + 16..coff + 18].try_into()?) as usize;
-        let count = pe.layout().sections.len();
-        if count >= 96 {
-            bail!("PE section-count limit reached");
-        }
-        let header = opt + optional_size + count * 40;
-        let first_raw = pe
+        let opt = u32_at(&pe.data, 0x3C)? as usize + 24;
+        let text = pe
             .layout()
             .sections
             .iter()
-            .filter(|s| s.raw_size > 0)
-            .map(|s| s.raw_ptr as usize)
-            .min()
-            .context("no file-backed sections")?;
-        let header_limit = (u32_at(&pe.data, opt + 60)? as usize)
-            .min(first_raw)
-            .min(pe.data.len());
-        let spare_header =
-            header + 40 <= header_limit && pe.data[header..header + 40].iter().all(|&b| b == 0);
-        if optional_size < 144 || u32_at(&pe.data, opt + 108)? < 4 {
-            bail!("missing exception data-directory slot");
-        }
-        let section_alignment = u32_at(&pe.data, opt + 32)?;
-        let file_alignment = u32_at(&pe.data, opt + 36)?;
-        align(0, file_alignment)?;
-        let end = pe
-            .layout()
-            .sections
-            .iter()
-            .try_fold(pe.layout().size_of_image, |end, s| {
-                Ok::<_, anyhow::Error>(
-                    end.max(
-                        s.virtual_address
-                            .checked_add(s.virtual_size.max(s.raw_size))
-                            .context("section overflow")?,
-                    ),
-                )
-            })?;
-        let rva = align(end, section_alignment)?;
-        let mut name = *b".sbrk\0\0\0";
-        for index in 0..96 {
-            let candidate = if index == 0 {
-                ".sbrk".to_owned()
-            } else {
-                format!(".sbrk{index}")
-            };
-            if !pe.layout().sections.iter().any(|s| s.name() == candidate) {
-                name.fill(0);
-                name[..candidate.len()].copy_from_slice(candidate.as_bytes());
-                break;
-            }
-        }
-        let (header, raw, extend) = if spare_header {
-            (
-                header,
-                align(u32::try_from(pe.data.len())?, file_alignment)?,
-                None,
-            )
-        } else {
-            // Extending the final mapped/file-backed section needs no new
-            // header or shifted raw offsets. Refuse overlays and virtual-only
-            // tails, whose bytes could acquire different mapped contents.
-            let (index, last) = pe
-                .layout()
-                .sections
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, s)| s.virtual_address)
-                .context("no sections")?;
-            if last.raw_size < last.virtual_size
-                || last.raw_size == 0
-                || last.raw_ptr as u64 + last.raw_size as u64 != pe.data.len() as u64
-                || last.characteristics & 0x80 != 0
-            {
-                bail!("no section-header room and final section cannot safely grow");
-            }
-            let raw = last
-                .raw_ptr
-                .checked_add(
-                    rva.checked_sub(last.virtual_address)
-                        .context("section RVA order")?,
-                )
-                .context("extended raw overflow")?;
-            if raw % file_alignment != 0 {
-                bail!("extended section raw alignment mismatch");
-            }
-            (opt + optional_size + index * 40, raw, Some(*last))
-        };
+            .find(|s| s.name() == ".text" && s.is_executable())
+            .context("output rebuild requires .text")?;
         Ok(Self {
-            rva,
-            raw,
-            header,
+            rva: text
+                .virtual_address
+                .checked_add(text.raw_size)
+                .context(".text append RVA overflow")?,
             opt,
-            coff,
-            section_alignment,
-            file_alignment,
-            extend,
-            name,
         })
     }
-
-    /// Build privately, validate by reparsing, then commit the complete image.
-    /// `entries` contains only new runtime functions; old entries remain valid.
+    /// Rebuild the existing .text section, moving later raw data and rebasing
+    /// supported address-bearing PE structures. Function sizes are unrestricted.
     pub fn commit(
         self,
         pe: &mut PeFile,
         mut code: Vec<u8>,
         entries: &[(u32, u32, u32)],
         patches: &[(usize, Vec<u8>)],
+        generated_unwind: &std::collections::BTreeSet<u32>,
     ) -> Result<()> {
-        let code_size = u32::try_from(code.len())?;
-        code.resize(align(code_size, 4)? as usize, 0);
-        let table_offset = u32::try_from(code.len())?;
+        let text = *pe
+            .layout()
+            .sections
+            .iter()
+            .find(|s| s.name() == ".text")
+            .context("missing .text")?;
+        let replaced: std::collections::BTreeSet<_> = patches
+            .iter()
+            .map(|(off, _)| text.virtual_address + (*off - text.raw_ptr as usize) as u32)
+            .collect();
+        let mut trampolines = Vec::new();
+        let mut chain_fixups = Vec::new();
+        for f in pe
+            .layout()
+            .runtime_functions
+            .iter()
+            .filter(|f| replaced.contains(&f.start))
+        {
+            let info = pe.layout().unwind_info(f.start).unwrap();
+            if let crate::pe::UnwindKind::Chained {
+                begin,
+                end,
+                unwind_rva,
+            } = info.kind
+            {
+                code.resize(align(u32::try_from(code.len())?, 4)? as usize, 0);
+                let offset = code.len();
+                let source = pe.layout().rva_to_offset(info.rva).unwrap();
+                code.extend_from_slice(&[0x21, 0, 0, pe.data[source + 3]]);
+                for value in [begin, end, unwind_rva] {
+                    code.extend_from_slice(&value.to_le_bytes());
+                }
+                trampolines.push((f.start, f.start + 5, self.rva + u32::try_from(offset)?));
+                chain_fixups.push((offset + 12, unwind_rva));
+            }
+        }
+        code.resize(align(u32::try_from(code.len())?, 4)? as usize, 0);
+        let table_offset = code.len();
+        let table_count = pe.layout().runtime_functions.len() - replaced.len()
+            + entries.len()
+            + trampolines.len();
+        let payload_size = table_offset
+            .checked_add(
+                table_count
+                    .checked_mul(12)
+                    .context("runtime table overflow")?,
+            )
+            .context("payload overflow")?;
+        let mut layout = crate::rebuild::Layout::new(pe, payload_size)?;
+        layout.structures()?;
         let mut table = Vec::new();
-        for f in &pe.layout().runtime_functions {
+        for f in pe
+            .layout()
+            .runtime_functions
+            .iter()
+            .filter(|f| !replaced.contains(&f.start))
+        {
             let info = pe
                 .layout()
                 .unwind_info(f.start)
                 .context("missing unwind info")?;
-            table.push((f.start, f.end, info.rva));
+            table.push((f.start, f.end, layout.rva(info.rva)?));
         }
-        table.extend_from_slice(entries);
+        for &(begin, end, unwind) in entries {
+            table.push((
+                begin,
+                end,
+                if generated_unwind.contains(&unwind) {
+                    unwind
+                } else {
+                    layout.rva(unwind)?
+                },
+            ));
+        }
+        table.extend(trampolines);
+        for (offset, rva) in chain_fixups {
+            code[offset..offset + 4].copy_from_slice(&layout.rva(rva)?.to_le_bytes());
+        }
         table.sort_unstable_by_key(|r| r.0);
         if table.windows(2).any(|w| w[0].1 > w[1].0) {
-            bail!("overlapping generated runtime functions");
+            bail!("overlapping rebuilt runtime functions");
         }
-        for &(begin, end, unwind) in &table {
-            code.extend_from_slice(&begin.to_le_bytes());
-            code.extend_from_slice(&end.to_le_bytes());
-            code.extend_from_slice(&unwind.to_le_bytes());
-        }
-        let virtual_size = u32::try_from(code.len())?;
-        let raw_size = align(virtual_size, self.file_alignment)?;
-        let image_size = align(
-            self.rva
-                .checked_add(virtual_size)
-                .context("image overflow")?,
-            self.section_alignment,
-        )?;
-        let mut output = pe.data.clone();
-        output.resize(
-            self.raw.checked_add(raw_size).context("file overflow")? as usize,
-            0,
-        );
-        output[self.raw as usize..self.raw as usize + code.len()].copy_from_slice(&code);
-        for (off, bytes) in patches {
-            if off
-                .checked_add(bytes.len())
-                .is_none_or(|end| end > pe.data.len())
-            {
-                bail!("patch outside original image");
+        for (begin, end, unwind) in table {
+            for value in [begin, end, unwind] {
+                code.extend_from_slice(&value.to_le_bytes());
             }
+        }
+        let text = pe.layout().sections[layout.text_index];
+        let insert = layout.text_end_raw;
+        let mut output = Vec::with_capacity(pe.data.len() + layout.raw_growth as usize);
+        output.extend_from_slice(&pe.data[..insert]);
+        output.resize(insert + layout.raw_growth as usize, 0);
+        output.extend_from_slice(&pe.data[insert..]);
+        layout.code(&mut output)?;
+        let source = code.clone();
+        // Only instruction bytes are patched here. Generated branch/scope RVAs
+        // already refer to their final .text addresses and must not be treated
+        // as old data RVAs merely because their numeric ranges overlap.
+        for &(begin, end, _) in entries {
+            let mut at = (begin - self.rva) as usize;
+            let limit = (end - self.rva) as usize;
+            while at < limit {
+                let ins = iced_x86::Decoder::with_ip(
+                    64,
+                    &source[at..limit],
+                    pe.layout().va(self.rva + at as u32),
+                    iced_x86::DecoderOptions::NONE,
+                )
+                .decode();
+                if ins.is_invalid() {
+                    bail!("invalid generated instruction in rebuilt .text");
+                }
+                layout.patch_instruction(&source[at..at + ins.len()], ins.ip(), &mut code, at)?;
+                at += ins.len();
+            }
+        }
+        output[insert..insert + code.len()].copy_from_slice(&code);
+        layout.apply(&mut output)?;
+        let original_table_rva = u32_at(&pe.data, self.opt + 112 + 3 * 8)?;
+        let original_table_size = u32_at(&pe.data, self.opt + 116 + 3 * 8)? as usize;
+        let original_table = pe
+            .layout()
+            .rva_to_offset(original_table_rva)
+            .context("original runtime table")?;
+        let retired_table = layout.raw(original_table)?;
+        output[retired_table..retired_table + original_table_size].fill(0);
+        let active_unwind: std::collections::BTreeSet<_> = pe
+            .layout()
+            .runtime_functions
+            .iter()
+            .filter(|f| !replaced.contains(&f.start))
+            .map(|f| pe.layout().unwind_info(f.start).unwrap().rva)
+            .chain(
+                entries
+                    .iter()
+                    .filter(|e| !generated_unwind.contains(&e.2))
+                    .map(|e| e.2),
+            )
+            .collect();
+        for f in pe
+            .layout()
+            .runtime_functions
+            .iter()
+            .filter(|f| replaced.contains(&f.start))
+        {
+            let info = pe.layout().unwind_info(f.start).unwrap();
+            if !active_unwind.contains(&info.rva) {
+                if let Some(scope) = pe.layout().c_specific.get(&f.start) {
+                    let from = layout.raw(pe.layout().rva_to_offset(info.rva).unwrap())?;
+                    let to = layout.raw(scope.table_bytes.end - 1)? + 1;
+                    output[from..to].fill(0);
+                }
+            }
+        }
+        for (off, bytes) in patches {
+            let start = text.virtual_address + (*off - text.raw_ptr as usize) as u32;
+            let extent = pe
+                .layout()
+                .runtime_functions
+                .iter()
+                .find(|f| f.start == start)
+                .context("entry patch has no function extent")?;
+            let end = *off + (extent.end - extent.start) as usize;
+            if *off < text.raw_ptr as usize || end > insert || bytes.len() != 5 {
+                bail!("entry rewrite outside original .text");
+            }
+            output[*off..end].fill(0xCC);
             output[*off..*off + bytes.len()].copy_from_slice(bytes);
         }
-        if let Some(last) = self.extend {
-            let delta = self.rva - last.virtual_address;
-            put(
-                &mut output,
-                self.header + 8,
-                delta
-                    .checked_add(virtual_size)
-                    .context("extended virtual size overflow")?,
-            );
-            put(
-                &mut output,
-                self.header + 16,
-                delta
-                    .checked_add(raw_size)
-                    .context("extended raw size overflow")?,
-            );
-            // Keep existing permissions, add executable/read/code, and retain
-            // unwind metadata by clearing DISCARDABLE for the enlarged section.
-            put(
-                &mut output,
-                self.header + 36,
-                (last.characteristics | 0x6000_0020) & !0x0200_0000,
-            );
-        } else {
-            output[self.header..self.header + 8].copy_from_slice(&self.name);
-            put(&mut output, self.header + 8, virtual_size);
-            put(&mut output, self.header + 12, self.rva);
-            put(&mut output, self.header + 16, raw_size);
-            put(&mut output, self.header + 20, self.raw);
-            put(&mut output, self.header + 36, 0x6000_0020);
-            output[self.coff + 2..self.coff + 4]
-                .copy_from_slice(&((pe.layout().sections.len() + 1) as u16).to_le_bytes());
-        }
-        put(&mut output, self.opt + 56, image_size);
-        put(
-            &mut output,
-            self.opt + 4,
-            u32_at(&pe.data, self.opt + 4)?
-                .checked_add(raw_size)
-                .context("code size overflow")?,
-        );
         put(
             &mut output,
             self.opt + 112 + 3 * 8,
             self.rva
-                .checked_add(table_offset)
-                .context("table overflow")?,
+                .checked_add(u32::try_from(table_offset)?)
+                .context("runtime table RVA overflow")?,
         );
         put(
             &mut output,
-            self.opt + 112 + 3 * 8 + 4,
-            u32::try_from(table.len() * 12)?,
+            self.opt + 116 + 3 * 8,
+            u32::try_from(table_count * 12)?,
         );
-        *pe = PeFile::parse(output)?;
+        let rebuilt = PeFile::parse(output)?;
+        if rebuilt.layout().sections.len() != pe.layout().sections.len()
+            || rebuilt
+                .layout()
+                .sections
+                .iter()
+                .zip(&pe.layout().sections)
+                .any(|(a, b)| a.name != b.name)
+        {
+            bail!(".text rebuild changed the original section set");
+        }
+        *pe = rebuilt;
         Ok(())
     }
 }

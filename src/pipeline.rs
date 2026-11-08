@@ -139,7 +139,7 @@ pub fn run(cli: &Cli) -> Result<String> {
             )?;
             pass(
                 "basic block relocation",
-                "expanded layout, explicit jumps, updated runtime-function table".into(),
+                "rebuilt .text, explicit jumps, updated runtime-function table".into(),
                 c,
             );
         } else {

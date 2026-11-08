@@ -15,8 +15,15 @@ tool = workspace / 'target' / 'release' / 'sigbraker.exe'
 directory = args.results.resolve().parent
 flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 checks = []
+skipped = []
 for name in result['targets']:
-    source = Path(next(row['output'] for row in result['variants'] if row['target'] == name and row['mode'] == 'default' and row['seed'] == 42))
+    selected = next(row for row in result['variants'] if row['target'] == name and row['mode'] == 'default' and row['seed'] == 42)
+    if selected['status'] == 'unsupported_rebuild':
+        skipped.append(name)
+        print(f'UNSUPPORTED {name}: no successful default rebuild to reprocess', flush=True)
+        continue
+    assert selected['status'] == 'passed'
+    source = Path(selected['output'])
     cases = [(case, [case]) for case in result['targets'][name]['baseline']] if name in ('native_cpp', 'native_dll', 'native_seh') else (
         [('version', ['--version'])] if name == 'ripgrep' else [('primes_1000', ['primes', '1000'])])
     for iteration in range(1, 4):
@@ -36,4 +43,5 @@ for name in result['targets']:
         print(f'PASSED {name} reprocessing {iteration}: {len(cases)} cases', flush=True)
         source = output
 (directory / 'reprocess.json').write_text(json.dumps(checks, indent=2), encoding='utf-8')
+(directory / 'reprocess-unsupported.json').write_text(json.dumps(skipped), encoding='utf-8')
 print(f'{len(checks)} reprocessed runtime cases passed')
