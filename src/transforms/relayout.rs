@@ -12,24 +12,79 @@ use iced_x86::{
     BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Instruction,
     InstructionBlock, InstructionInfoFactory, Mnemonic, OpAccess, Register,
 };
-use rand::{seq::SliceRandom, Rng};
+use rand::{seq::SliceRandom, Rng, RngCore};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct EncodedFunction {
     pub code: Vec<u8>,
     pub address_map: BTreeMap<u64, u64>,
     pub inserted_jumps: usize,
+    /// Inert filler instructions emitted into unreachable gaps.
+    pub junk: usize,
     pub spans: Vec<(u64, std::ops::Range<u64>)>,
+}
+
+/// Unreachable-filler configuration for relocated bodies.
+#[derive(Clone, Copy)]
+pub struct JunkConfig {
+    /// Per-gap probability of inserting filler.
+    pub probability: f64,
+    /// Whether the body end may grow. v2 unwind epilogue distances are
+    /// end-relative and capped at 4095, so bodies with such metadata skip the
+    /// trailing filler (mid-body filler is distance-neutral).
+    pub trailing: bool,
+}
+
+/// Canonical never-faulting filler: multi-byte `nop` forms (which do not
+/// access memory), `int3`, and inert segment prefixes. Filler is placed only
+/// where control cannot reach, so any byte pattern would be safe, but keeping
+/// every filler a valid instruction keeps linear disassembly and the encoder
+/// verification meaningful. The templates avoid RIP-relative operands so a
+/// filler decodes identically at any address.
+const JUNK: &[&[u8]] = &[
+    &[0x90],
+    &[0x90],
+    &[0x90],
+    &[0x66, 0x90],
+    &[0x66, 0x90],
+    &[0x0F, 0x1F, 0x00],
+    &[0x0F, 0x1F, 0x00],
+    &[0x26, 0x90],
+    &[0x2E, 0x90],
+    &[0x36, 0x90],
+    &[0x3E, 0x90],
+    &[0x0F, 0x1F, 0x40, 0x00],
+    &[0x66, 0x0F, 0x1F, 0x00],
+    &[0xCC],
+    &[0x0F, 0x1F, 0x44, 0x00, 0x00],
+    &[0x66, 0x0F, 0x1F, 0x40, 0x00],
+    &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+    &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+    &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+];
+
+/// Draws one gap's worth of filler: 1-4 random templates.
+fn junk_gap(rng: &mut dyn RngCore) -> Vec<&'static [u8]> {
+    (0..rng.gen_range(1..=4)).map(|_| JUNK[rng.gen_range(0..JUNK.len())]).collect()
 }
 
 /// Encode a requested block permutation with explicit fall-through edges.
 /// All generated instruction semantics, branch destinations and memory targets
 /// are checked by decoding the emitted bytes independently of the encoder.
+///
+/// `lead` is the number of leading blocks the prologue spans: filler is never
+/// emitted before or inside them so unwind code offsets stay valid. When
+/// `junk` is set, every gap after an unconditional terminator (and, if
+/// allowed, the body end) is padded with inert filler instructions that no
+/// executed path can reach.
 pub fn encode_function(
     func: &Function,
     new_ip: u64,
     order: &[usize],
     data: &[u8],
+    lead: usize,
+    mut junk: Option<(&mut dyn RngCore, JunkConfig)>,
 ) -> Result<EncodedFunction> {
     if order.first() != Some(&0)
         || order.len() != func.blocks.len()
@@ -40,6 +95,7 @@ pub fn encode_function(
     let mut instructions = Vec::new();
     let mut synthetic = BTreeSet::new();
     let mut synthetic_origins = BTreeMap::new();
+    let mut junk_bytes = BTreeMap::<u64, &'static [u8]>::new();
     let mut next_synthetic = u64::MAX;
     let used_ips: BTreeSet<_> = func
         .blocks
@@ -47,10 +103,44 @@ pub fn encode_function(
         .flat_map(|b| &b.instrs)
         .map(|i| i.iced.ip())
         .collect();
+    // Filler is unreachable only after an unconditional terminator, so a gap
+    // that a fall-through crosses (epilogue chains, pinned adjacency) never
+    // receives any.
+    let mut dead = false;
+    let mut junk_count = 0usize;
+    let emit_junk = |instructions: &mut Vec<Instruction>,
+                     junk_bytes: &mut BTreeMap<u64, &[u8]>,
+                     next_synthetic: &mut u64,
+                     rng: &mut dyn RngCore|
+     -> usize {
+        let mut inserted = 0;
+        for bytes in junk_gap(rng) {
+            while used_ips.contains(next_synthetic) {
+                *next_synthetic -= 1;
+            }
+            let ip = *next_synthetic;
+            *next_synthetic -= 1;
+            junk_bytes.insert(ip, bytes);
+            instructions.push(
+                Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE).decode(),
+            );
+            inserted += 1;
+        }
+        inserted
+    };
     for (position, &bi) in order.iter().enumerate() {
         let block = &func.blocks[bi];
+        if dead && position >= lead {
+            if let Some((rng, config)) = junk.as_mut() {
+                if rng.gen_bool(config.probability) {
+                    junk_count +=
+                        emit_junk(&mut instructions, &mut junk_bytes, &mut next_synthetic, rng);
+                }
+            }
+        }
         instructions.extend(block.instrs.iter().map(|i| i.iced));
         let last = block.instrs.last().context("empty basic block")?;
+        dead = !last.falls_through();
         if last.falls_through() {
             // When the fall-through successor is emitted immediately after,
             // control flows naturally and no synthetic jump is needed. This
@@ -75,6 +165,17 @@ pub fn encode_function(
             synthetic_origins.insert(next_synthetic, last.iced.next_ip());
             next_synthetic -= 1;
             instructions.push(jump);
+            dead = true;
+        }
+    }
+    // Trailing filler after the last terminator. v2 unwind epilogue distances
+    // are end-relative, so bodies carrying such metadata keep their end.
+    if dead {
+        if let Some((rng, config)) = junk.as_mut() {
+            if config.trailing && rng.gen_bool(config.probability) {
+                junk_count +=
+                    emit_junk(&mut instructions, &mut junk_bytes, &mut next_synthetic, rng);
+            }
         }
     }
     // Preserve encodings that do not depend on IP, including redundant REX
@@ -90,6 +191,13 @@ pub fn encode_function(
     let encoding: Vec<_> = instructions
         .iter()
         .map(|instruction| {
+            // Filler is emitted byte-exactly: it exists to break byte
+            // signatures, so re-encoding it canonically would be pointless.
+            if let Some(bytes) = junk_bytes.get(&instruction.ip()) {
+                let mut fixed = Instruction::with_declare_byte(bytes)?;
+                fixed.set_ip(instruction.ip());
+                return Ok(fixed);
+            }
             if !instruction.is_ip_rel_memory_operand()
                 && !matches!(
                     instruction.flow_control(),
@@ -167,6 +275,11 @@ pub fn encode_function(
             }
         }
         consumed += decoded.len();
+        // Filler has no original counterpart: it must stay out of the span
+        // table that exception relocation walks.
+        if junk_bytes.contains_key(&original.ip()) {
+            continue;
+        }
         spans.push((
             synthetic_origins
                 .get(&original.ip())
@@ -199,15 +312,35 @@ pub fn encode_function(
         code: encoded.code_buffer,
         address_map: map
             .into_iter()
-            .filter(|(ip, _)| !synthetic.contains(ip))
+            .filter(|(ip, _)| !synthetic.contains(ip) && !junk_bytes.contains_key(ip))
             .collect(),
         inserted_jumps: synthetic.len(),
+        junk: junk_count,
         spans,
     })
 }
 
-fn import_tail(ins: &Instruction, pe: &PeLayout) -> bool {
-    ins.is_jmp_near_indirect()
+/// Whether a byte span contains three consecutive aligned dwords that point
+/// into executable code: the shape of an embedded RVA table (switch dispatch
+/// data). Such tables can be read in place by code the reference analysis
+/// never attributed them to, so their extents must not be scrubbed.
+fn contains_embedded_table(data: &[u8], code_rvas: std::ops::Range<u32>) -> bool {
+    let mut run = 0;
+    for chunk in data.chunks_exact(4) {
+        let value = u32::from_le_bytes(chunk.try_into().unwrap());
+        if code_rvas.contains(&value) {
+            run += 1;
+            if run >= 3 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+fn import_tail(ins: &Instruction, pe: &PeLayout) -> bool {    ins.is_jmp_near_indirect()
         && ins.segment_prefix() == Register::None
         && ins.is_ip_rel_memory_operand()
         && ins
@@ -521,7 +654,7 @@ pub fn run(
     probability: f64,
     rng: &mut impl Rng,
 ) -> Result<Counters> {
-    run_with_segments(analysis, pe, probability, rng, None)
+    run_with_segments(analysis, pe, probability, rng, None, 0.0, false)
 }
 
 pub fn run_with_segments(
@@ -530,9 +663,13 @@ pub fn run_with_segments(
     probability: f64,
     rng: &mut impl Rng,
     segments: Option<&super::segment_inject::Config>,
+    junk_probability: f64,
+    wipe_original: bool,
 ) -> Result<Counters> {
     let mut c = Counters::default();
     if (probability == 0.0 && segments.is_none()) || pe.layout().runtime_functions.is_empty() {
+        // Filler lives inside relocated bodies: without block relocation
+        // there is nothing to pad.
         return Ok(c);
     }
     let plan = SectionPlan::new_with_address_rewrites(
@@ -570,6 +707,8 @@ pub fn run_with_segments(
     let mut entries = Vec::new();
     let mut generated_unwind = BTreeSet::new();
     let mut patches = Vec::new();
+    let mut wipes = Vec::new();
+    let mut wiped_ranges = Vec::new();
     let mut continuation_updates = BTreeMap::new();
     let mut global_map = BTreeMap::new();
     for (index, f) in analysis.functions.iter().enumerate() {
@@ -592,13 +731,45 @@ pub fn run_with_segments(
             }
         };
         c.candidates += 1;
+        // A retained original body may only be scrubbed when nothing can
+        // still reference its interior: every foreign edge must be
+        // re-encodable (the commit phase rewrites it) and no data value may
+        // point inside. The stale-reference relaxation that lets other
+        // functions relocate does not apply here.
+        let can_wipe = wipe_original
+            && stale_ok
+            && analysis.interior_movable(index, f.start_rva + 1..f.end_rva, false)
+            && address_taken
+                .range(f.start_rva + 1..f.end_rva)
+                .next()
+                .is_none()
+            && !contains_embedded_table(
+                &pe.data[f.off..f.off + (f.end_rva - f.start_rva) as usize],
+                {
+                    let secs: Vec<_> = layout.executable_sections().collect();
+                    let start = secs.iter().map(|s| s.virtual_address).min().unwrap_or(0);
+                    let end = secs
+                        .iter()
+                        .map(|s| s.virtual_address.saturating_add(s.virtual_size))
+                        .max()
+                        .unwrap_or(0);
+                    start..end
+                },
+            );
         let mut expanded = f.clone();
         expanded.trim_dead_tail();
         let block_count = expanded.blocks.len();
         let shuffle = rng.gen::<f64>() < probability && block_count >= 3;
+        // Leading blocks the prologue spans; filler never enters them.
+        let prologue_end = layout.unwind_info(f.start_rva).unwrap().prologue_end;
+        let lead = expanded
+            .blocks
+            .iter()
+            .take_while(|b| b.end_rva < prologue_end)
+            .count()
+            + 1;
         let mut prefixed = 0;
         if let Some(cfg) = segments {
-            let prologue_end = layout.unwind_info(f.start_rva).unwrap().prologue_end;
             for ins in expanded.blocks.iter_mut().flat_map(|b| &mut b.instrs) {
                 if ins.rva >= prologue_end
                     && ins.iced.flow_control() == FlowControl::Next
@@ -631,13 +802,6 @@ pub fn run_with_segments(
             // Adjacency constraints: blocks the prologue spans, and blocks an
             // epilogue continues into, must stay adjacent and in their original
             // relative order. The shuffle permutes whole constraint groups.
-            let prologue_end = layout.unwind_info(f.start_rva).unwrap().prologue_end;
-            let lead = expanded
-                .blocks
-                .iter()
-                .take_while(|b| b.end_rva < prologue_end)
-                .count()
-                + 1;
             let mut next_pin = vec![false; block_count];
             for k in 0..lead.saturating_sub(1) {
                 next_pin[k] = true;
@@ -685,11 +849,26 @@ pub fn run_with_segments(
             }
             order = shuffled;
         }
-        let Ok(encoded) = encode_function(&expanded, layout.va(rva), &order, &pe.data) else {
-            c.reverted += 1;
-            continue;
-        };
         let info = layout.unwind_info(f.start_rva).unwrap();
+        let junk = (junk_probability > 0.0).then(|| {
+            (
+                &mut *rng as &mut dyn RngCore,
+                JunkConfig {
+                    probability: junk_probability,
+                    // v2 epilogue distances are end-relative (capped at 4095);
+                    // mid-body filler is distance-neutral.
+                    trailing: info.v2.is_none(),
+                },
+            )
+        });
+        let encoded = match encode_function(&expanded, layout.va(rva), &order, &pe.data, lead, junk)
+        {
+            Ok(encoded) => encoded,
+            Err(_) => {
+                c.reverted += 1;
+                continue;
+            }
+        };
         let prologue_len = (info.prologue_end - f.start_rva) as usize;
         // The prologue must keep instruction boundaries and register-saving
         // effects so unwind code offsets stay valid. Bytes may differ only
@@ -881,13 +1060,54 @@ pub fn run_with_segments(
             continuation_updates.insert(old, u32::try_from(target - layout.image_base)?);
         }
         entries.push((rva, end, unwind_rva));
-        payload.resize(offset as usize, 0xCC);
+        // Inter-function padding is unreachable dead space: random bytes there
+        // break end-of-function signatures just like the in-body filler.
+        let pad = payload.len();
+        payload.resize(offset as usize, 0);
+        rng.fill_bytes(&mut payload[pad..]);
         payload.extend_from_slice(&encoded.code);
         if !exception_bytes.is_empty() {
+            let pad = payload.len();
             payload.resize(unwind_offset as usize, 0);
+            rng.fill_bytes(&mut payload[pad..]);
             payload.extend_from_slice(&exception_bytes);
         }
         c.applied += 1;
+        c.junk_inserted += encoded.junk as u64;
+        if can_wipe {
+            // Scrub the retained body, but spare jump-table bytes: tables are
+            // live data rewritten in place (sometimes the table is the whole
+            // runtime extent), and wiping them would corrupt dispatches.
+            let mut spans = vec![(f.off + 5, (f.end_rva - f.start_rva) as usize - 5)];
+            let wipe_end = f.off + (f.end_rva - f.start_rva) as usize;
+            for table in analysis.functions.iter().flat_map(|g| &g.jump_tables) {
+                if table.bytes.start >= wipe_end || table.bytes.end <= f.off + 5 {
+                    continue;
+                }
+                spans = spans
+                    .into_iter()
+                    .flat_map(|(at, len)| {
+                        let end = at + len;
+                        let t0 = table.bytes.start.max(at);
+                        let t1 = table.bytes.end.min(end);
+                        if t0 >= t1 {
+                            return vec![(at, len)];
+                        }
+                        let mut out = Vec::new();
+                        if t0 > at {
+                            out.push((at, t0 - at));
+                        }
+                        if end > t1 {
+                            out.push((t1, end - t1));
+                        }
+                        out
+                    })
+                    .collect();
+            }
+            wipes.extend(spans);
+            wiped_ranges.push((f.start_rva, f.end_rva));
+            c.wiped_original += 1;
+        }
         c.relocated_c_specific += u64::from(layout.c_specific.contains_key(&f.start_rva));
         if let Some(cpp) = layout.cpp_eh.get(&f.start_rva) {
             c.relocated_fh3 += u64::from(!cpp.is_fh4());
@@ -1032,7 +1252,13 @@ pub fn run_with_segments(
                 .map(|r| continuation_updates.get(r).copied().unwrap_or(*r))
                 .collect();
             if plan.retains_original_bodies() {
-                targets.extend(layout.eh_continuations.iter().copied());
+                // Stale targets stay valid only where the original bytes
+                // survive; scrubbed bodies must not keep table entries.
+                targets.extend(layout.eh_continuations.iter().copied().filter(|r| {
+                    !wiped_ranges
+                        .iter()
+                        .any(|(start, end)| *r > *start && *r < *end)
+                }));
             }
             targets.sort_unstable();
             targets.dedup();
@@ -1071,6 +1297,7 @@ pub fn run_with_segments(
             &patches,
             &generated_unwind,
             &metadata_patches,
+            &wipes,
         )?;
     }
     Ok(c)

@@ -19,6 +19,7 @@ pub fn run(cli: &Cli) -> Result<String> {
         ("--seg-prob", cli.seg_prob),
         ("--reorder-prob", cli.reorder_prob),
         ("--shuffle-prob", cli.shuffle_prob),
+        ("--junk-prob", cli.junk_prob),
     ] {
         if !(0.0..=1.0).contains(&p) {
             bail!("{name} must be within [0, 1], got {p}");
@@ -144,6 +145,8 @@ pub fn run(cli: &Cli) -> Result<String> {
                 },
                 &mut rng,
                 segments.as_ref(),
+                cli.junk_prob,
+                cli.wipe_original,
             )?;
             pass(
                 "basic block relocation",

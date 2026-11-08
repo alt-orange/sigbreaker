@@ -21,6 +21,10 @@ pub struct Counters {
     pub relocated_import_tails: u64,
     /// Instructions whose bytes were rewritten or relocated in place.
     pub instructions_touched: u64,
+    /// Inert filler instructions inserted into unreachable gaps.
+    pub junk_inserted: u64,
+    /// Relocated functions whose retained original body was scrubbed.
+    pub wiped_original: u64,
     /// Items skipped because they overlap a base-relocation fixup.
     pub skipped_pinned: u64,
     /// Items skipped because no length-preserving encoding existed.
@@ -46,6 +50,8 @@ impl Counters {
         push("import-tail functions", self.relocated_import_tails);
         push("skipped (unwind/exception metadata)", self.skipped_metadata);
         push("instructions touched", self.instructions_touched);
+        push("junk instructions", self.junk_inserted);
+        push("original bodies wiped", self.wiped_original);
         push("candidates", self.candidates);
         push("skipped (relocated bytes)", self.skipped_pinned);
         push("skipped (no in-place room)", self.skipped_no_room);

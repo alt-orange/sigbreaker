@@ -13,6 +13,11 @@
 //!    variant of Kahn's algorithm produces a valid topological order.
 //! 3. **Basic block shuffling** — chains of basic blocks that pass movement
 //!    checks are relayouted, with recognized direct branches patched explicitly.
+//! 4. **Junk code injection** — unreachable gaps in relocated bodies (after
+//!    unconditional terminators) are padded with random inert instructions
+//!    (multi-byte nops, int3, segment prefixes) and inter-function padding is
+//!    randomized, shattering byte-signature matches without touching any
+//!    executed path.
 //!
 //! Supported version-1 functions can grow or move with updated runtime entries
 //! and recognized C-specific SEH scopes. Unknown exception formats and unresolved

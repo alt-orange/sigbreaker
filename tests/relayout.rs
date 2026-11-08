@@ -301,7 +301,7 @@ fn planner_widens_short_conditional_branch() {
     let p = fixture_code(&code);
     let a = Analysis::run(p.layout(), &p.data).unwrap();
     let encoded =
-        relayout::encode_function(&a.functions[0], p.layout().va(0x4000), &[0, 2, 1], &p.data)
+        relayout::encode_function(&a.functions[0], p.layout().va(0x4000), &[0, 2, 1], &p.data, usize::MAX, None)
             .unwrap();
     let mut d = Decoder::with_ip(
         64,
@@ -327,7 +327,7 @@ fn planner_preserves_external_rip_memory_target() {
     ]);
     let a = Analysis::run(p.layout(), &p.data).unwrap();
     let encoded =
-        relayout::encode_function(&a.functions[0], p.layout().va(0x4000), &[0, 2, 1], &p.data)
+        relayout::encode_function(&a.functions[0], p.layout().va(0x4000), &[0, 2, 1], &p.data, usize::MAX, None)
             .unwrap();
     let mut d = Decoder::with_ip(
         64,
@@ -424,10 +424,10 @@ fn planner_inserts_fallthrough_jump_and_rejects_duplicate_blocks() {
     let p = fixture();
     let a = Analysis::run(p.layout(), &p.data).unwrap();
     let f = &a.functions[0];
-    let encoded = relayout::encode_function(f, p.layout().va(0x4000), &[0, 2, 1], &p.data).unwrap();
+    let encoded = relayout::encode_function(f, p.layout().va(0x4000), &[0, 2, 1], &p.data, usize::MAX, None).unwrap();
     assert_eq!(encoded.inserted_jumps, 1);
     assert_eq!(encoded.address_map.len(), f.instr_count);
-    assert!(relayout::encode_function(f, p.layout().va(0x4000), &[0, 1, 1], &p.data).is_err());
+    assert!(relayout::encode_function(f, p.layout().va(0x4000), &[0, 1, 1], &p.data, usize::MAX, None).is_err());
 }
 
 #[test]
@@ -500,7 +500,7 @@ fn growing_prefixes_expand_dense_memory_instructions_without_shuffling() {
         0
     );
     let count =
-        relayout::run_with_segments(&a, &mut p, 0.0, &mut StdRng::seed_from_u64(42), Some(&cfg))
+        relayout::run_with_segments(&a, &mut p, 0.0, &mut StdRng::seed_from_u64(42), Some(&cfg), 0.0, false)
             .unwrap();
     assert_eq!(count.applied, 1);
     let f = p.layout().runtime_functions.last().unwrap();
@@ -557,6 +557,8 @@ fn growing_prefixes_support_one_and_two_blocks_and_preserve_results() {
             1.0,
             &mut StdRng::seed_from_u64(42),
             Some(&cfg),
+            0.0,
+            false,
         )
         .unwrap();
         assert_eq!(grown.applied, 1);
@@ -614,7 +616,7 @@ fn rebuilt_text_can_move_data_rvas_and_raw_offsets_without_new_sections() {
     let plan = sigbraker::writer::SectionPlan::new(&pe).unwrap();
     let start = plan.rva;
     let encoded =
-        relayout::encode_function(&a.functions[0], pe.layout().va(start), &[0, 2, 1], &pe.data)
+        relayout::encode_function(&a.functions[0], pe.layout().va(start), &[0, 2, 1], &pe.data, usize::MAX, None)
             .unwrap();
     let end = start + encoded.code.len() as u32;
     let mut payload = encoded.code;
@@ -661,3 +663,5 @@ fn rebuilt_text_can_move_data_rvas_and_raw_offsets_without_new_sections() {
     assert_eq!(&pe.data[cert..cert + 8], b"testcert");
     assert!(pe.data[0x405..0x416].iter().all(|b| *b == 0xCC));
 }
+
+

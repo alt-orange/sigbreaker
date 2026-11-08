@@ -130,7 +130,7 @@ impl SectionPlan {
         patches: &[(usize, Vec<u8>)],
         generated_unwind: &std::collections::BTreeSet<u32>,
     ) -> Result<()> {
-        self.commit_with_metadata(pe, code, entries, patches, generated_unwind, &[])
+        self.commit_with_metadata(pe, code, entries, patches, generated_unwind, &[], &[])
     }
     pub fn commit_with_metadata(
         self,
@@ -140,9 +140,10 @@ impl SectionPlan {
         patches: &[(usize, Vec<u8>)],
         generated_unwind: &std::collections::BTreeSet<u32>,
         metadata_patches: &[(usize, Vec<u8>)],
+        wipes: &[(usize, usize)],
     ) -> Result<()> {
         if self.append_section {
-            return self.commit_section(pe, code, entries, patches, metadata_patches);
+            return self.commit_section(pe, code, entries, patches, metadata_patches, wipes);
         }
         let text = *pe
             .layout()
@@ -356,6 +357,7 @@ impl SectionPlan {
         entries: &[(u32, u32, u32)],
         patches: &[(usize, Vec<u8>)],
         metadata_patches: &[(usize, Vec<u8>)],
+        wipes: &[(usize, usize)],
     ) -> Result<()> {
         let count = pe.layout().sections.len();
         let new_count = u16::try_from(count + 1).context("too many PE sections")?;
@@ -566,6 +568,16 @@ impl SectionPlan {
                 .get_mut(dest..dest + bytes.len())
                 .context("entry patch outside file")?
                 .copy_from_slice(bytes);
+        }
+        // Scrub proven-clean original bodies after the trampolines above were
+        // placed. Wipe spans already exclude the 5-byte entry jumps and any
+        // jump-table bytes; what remains is unreachable int3 padding.
+        for (off, len) in wipes {
+            let dest = map_raw(*off)?;
+            output
+                .get_mut(dest..dest + *len)
+                .context("original body wipe outside file")?
+                .fill(0xCC);
         }
         *pe = PeFile::parse_with_symbols(output, pe.layout().handler_symbols.clone())?;
         Ok(())

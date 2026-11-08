@@ -82,6 +82,17 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0)]
     pub shuffle_prob: f64,
 
+    /// Probability [0, 1] of padding each unreachable gap in a relocated body
+    /// with inert junk code (multi-byte nops, int3 and segment prefixes).
+    #[arg(long, default_value_t = 1.0)]
+    pub junk_prob: f64,
+
+    /// Scrub the retained original body of every relocated function whose
+    /// reference closure is provably clean. Functions whose interiors are
+    /// still referenced through non-re-encodable edges keep their bodies.
+    #[arg(long)]
+    pub wipe_original: bool,
+
     /// Disable segment selector injection.
     #[arg(long)]
     pub no_seg_inject: bool,

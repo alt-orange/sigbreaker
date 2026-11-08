@@ -53,7 +53,7 @@ fn c_specific_scopes_split_with_layout_and_keep_continuation_and_priority() {
     let f = &a.functions[0];
     let old = &pe.layout().c_specific[&0x1000];
     let encoded =
-        relayout::encode_function(f, pe.layout().va(0x4000), &[0, 2, 1], &pe.data).unwrap();
+        relayout::encode_function(f, pe.layout().va(0x4000), &[0, 2, 1], &pe.data, usize::MAX, None).unwrap();
     let rewritten = exception::relocate(
         old,
         pe.layout().image_base,
@@ -223,3 +223,4 @@ fn mutated_imports_thunks_and_scope_tables_reject_cleanly() {
         );
     }
 }
+
