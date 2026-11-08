@@ -1,0 +1,40 @@
+"""Structural assertions for the controlled native test fixtures."""
+import struct
+
+
+def relocated_export(data, export_name):
+    pe = struct.unpack_from('<I', data, 0x3C)[0]
+    opt = pe + 24
+    count = struct.unpack_from('<H', data, pe + 6)[0]
+    table = opt + struct.unpack_from('<H', data, pe + 20)[0]
+    sections = []
+    for i in range(count):
+        at = table + 40 * i
+        name = data[at:at + 8].rstrip(b'\0')
+        virtual_size, rva, raw_size, raw = struct.unpack_from('<IIII', data, at + 8)
+        sections.append((name, virtual_size, rva, raw_size, raw))
+
+    def offset(rva):
+        return next(raw + rva - base for _, _, base, size, raw in sections if base <= rva < base + size)
+
+    exports = offset(struct.unpack_from('<I', data, opt + 112)[0])
+    names_count = struct.unpack_from('<I', data, exports + 24)[0]
+    eat, names, ordinals = struct.unpack_from('<III', data, exports + 28)
+    for i in range(names_count):
+        name_at = offset(struct.unpack_from('<I', data, offset(names) + 4 * i)[0])
+        name = data[name_at:data.index(0, name_at)].decode('ascii')
+        if name != export_name:
+            continue
+        ordinal = struct.unpack_from('<H', data, offset(ordinals) + 2 * i)[0]
+        rva = struct.unpack_from('<I', data, offset(eat) + 4 * ordinal)[0]
+        at = offset(rva)
+        if data[at] != 0xE9:
+            return None
+        target = rva + 5 + struct.unpack_from('<i', data, at + 1)[0]
+        if not any(name == b'.sbrk' and base <= target < base + size for name, size, base, _, _ in sections):
+            return None
+        runtime, size = struct.unpack_from('<II', data, opt + 112 + 3 * 8)
+        entries = [struct.unpack_from('<III', data, offset(runtime) + index) for index in range(0, size, 12)]
+        assert any(begin == target for begin, _, _ in entries), 'relocated export lacks runtime-function entry'
+        return {'entry_rva': rva, 'relocated_rva': target}
+    raise AssertionError(f'Missing fixture export: {export_name}')

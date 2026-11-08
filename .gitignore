@@ -1,0 +1,13 @@
+# Rust builds and native validation outputs
+/target/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local IDE settings
+/.idea/
+/.vscode/
+
+# Temporary output publication files
+.sigbraker-*.tmp

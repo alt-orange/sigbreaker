@@ -1,0 +1,27 @@
+[package]
+name = "sigbraker"
+version = "1.0.0"
+edition = "2021"
+description = "SigBreaker 1.0 — binary diversification engine for x86-64 PE files: segment selector injection, instruction reordering, and basic block shuffling."
+license = "MIT"
+repository = "https://example.invalid/sigbraker"
+keywords = ["binary", "obfuscation", "diversification", "pe", "x86"]
+categories = ["command-line-utilities", "encoding"]
+
+[lib]
+name = "sigbraker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sigbraker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+iced-x86 = { version = "1.22", features = ["decoder", "encoder", "instr_info"] }
+rand = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
