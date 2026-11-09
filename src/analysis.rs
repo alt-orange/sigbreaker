@@ -151,6 +151,8 @@ pub struct Analysis {
     /// Direct branch/call sources per target: `(owning region, instruction)`.
     /// Foreign edges into a relocated interior are rewritten to the new target.
     pub branch_sources: BTreeMap<u32, Vec<(usize, Instr)>>,
+    /// Reachable instructions pinned solely by chained unwind metadata.
+    metadata_only_pins: BTreeSet<u32>,
 }
 
 impl Analysis {
@@ -162,6 +164,7 @@ impl Analysis {
         let mut data_refs = BTreeSet::new();
         let mut branch_sources = BTreeMap::<u32, Vec<(usize, Instr)>>::new();
         let mut address_references = BTreeMap::<u32, Vec<Instr>>::new();
+        let mut metadata_only_pins = BTreeSet::new();
         call_targets.extend(pe.code_roots.iter().copied());
         let roots = if pe.runtime_functions.is_empty() {
             Self::discover_roots(pe, data)
@@ -173,7 +176,10 @@ impl Analysis {
             for (start_rel, end_rel) in Self::region_bounds(pe, data, sec, &roots) {
                 let f_idx = functions.len();
                 let Some(func) =
-                    Self::lift_region(pe, data, sec, start_rel, end_rel, f_idx, &mut branch_owners)
+                    Self::lift_region(
+                        pe, data, sec, start_rel, end_rel, f_idx, &mut branch_owners,
+                        &mut metadata_only_pins,
+                    )
                 else {
                     continue;
                 };
@@ -242,7 +248,16 @@ impl Analysis {
             data_refs,
             address_references,
             branch_sources,
+            metadata_only_pins,
         })
+    }
+
+    pub(crate) fn pinned_only_by_unwind(&self, ins: &Instr) -> bool {
+        self.metadata_only_pins.contains(&ins.rva)
+    }
+
+    pub(crate) fn references_code_as_data(&self, range: Range<u32>) -> bool {
+        self.data_refs.range(range).next().is_some()
     }
 
     /// Whether `rva` might be referenced from outside function `f_idx`
@@ -497,6 +512,7 @@ impl Analysis {
         end_rel: u32,
         f_idx: usize,
         branch_owners: &mut BTreeMap<u32, Vec<usize>>,
+        metadata_only_pins: &mut BTreeSet<u32>,
     ) -> Option<Function> {
         let off = sec.raw_ptr as usize + start_rel as usize;
         let region_len = (end_rel - start_rel) as usize;
@@ -612,11 +628,21 @@ impl Analysis {
                 for table in jump_tables.iter().filter(|t| t.branch == ins.rva) {
                     pending.extend(table.targets.iter().copied());
                 }
-                if ins.falls_through() {
+                // Windows user-mode INT 29h terminates the process. Padding
+                // after it can contain bytes outside the linear instruction set.
+                let fast_fail = pe.windows_user_mode
+                    && ins.iced.mnemonic() == iced_x86::Mnemonic::Int
+                    && ins.iced.immediate8() == 0x29;
+                if ins.falls_through() && !fast_fail {
                     pending.push(ins.rva + ins.len as u32);
                 }
             }
             for (i, ins) in instrs.iter_mut().enumerate() {
+                if ins.pinned && !ambiguous && reached.contains(&i)
+                    && !pe.is_protected(ins.off..ins.off + ins.len)
+                {
+                    metadata_only_pins.insert(ins.rva);
+                }
                 ins.pinned |= ambiguous || !reached.contains(&i);
                 ins.dead = !ambiguous && !reached.contains(&i);
             }

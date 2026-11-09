@@ -25,8 +25,12 @@ pub struct Counters {
     pub junk_inserted: u64,
     /// Instructions rewritten into an equivalent aliased opcode encoding.
     pub aliases: u64,
-    /// Relocated functions whose retained original body was scrubbed.
+    /// Relocated functions with bytes scrubbed from their original bodies.
     pub wiped_original: u64,
+    /// Original body bytes covered by the scrub spans.
+    pub original_bytes_wiped: u64,
+    /// Calls in retained bodies redirected to their relocated counterparts.
+    pub redirected_original_calls: u64,
     /// Items skipped because they overlap a base-relocation fixup.
     pub skipped_pinned: u64,
     /// Items skipped because no length-preserving encoding existed.
@@ -55,6 +59,8 @@ impl Counters {
         push("junk instructions", self.junk_inserted);
         push("aliased instructions", self.aliases);
         push("original bodies wiped", self.wiped_original);
+        push("original bytes wiped", self.original_bytes_wiped);
+        push("original calls redirected", self.redirected_original_calls);
         push("candidates", self.candidates);
         push("skipped (relocated bytes)", self.skipped_pinned);
         push("skipped (no in-place room)", self.skipped_no_room);

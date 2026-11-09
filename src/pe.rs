@@ -56,6 +56,7 @@ pub struct PeLayout {
     pub image_base: u64,
     pub entry_rva: u32,
     pub size_of_image: u32,
+    pub(crate) windows_user_mode: bool,
     pub sections: Vec<SectionHeader>,
     /// Authoritative code extents from the PE exception directory.
     pub runtime_functions: Vec<Range<u32>>,
@@ -79,6 +80,8 @@ pub struct PeLayout {
     /// Values inside them are unwind codes and language-table fields, not
     /// data pointers into code.
     pub unwind_bytes: Vec<Range<usize>>,
+    /// Validated PE records already handled by typed metadata readers.
+    pointer_scan_exclusions: Vec<Range<usize>>,
     unwind: BTreeMap<u32, UnwindInfo>,
     /// File-offset ranges the loader patches via `.reloc`; never touch these.
     protected: Vec<Range<usize>>,
@@ -207,6 +210,14 @@ impl PeLayout {
                 {
                     continue;
                 }
+                // Runtime records describe function extents, and relocation
+                // records describe fixup locations. Both are parsed separately.
+                let scan = |size| {
+                    at + size <= range.end
+                        && !self.pointer_scan_exclusions.iter().any(|r| {
+                            r.start <= at && at + size <= r.end
+                        })
+                };
                 if self
                     .c_specific
                     .values()
@@ -222,13 +233,13 @@ impl PeLayout {
                 {
                     continue;
                 }
-                if let Some(bytes) = data.get(at..at + 4).filter(|_| at + 4 <= range.end) {
+                if let Some(bytes) = data.get(at..at + 4).filter(|_| scan(4)) {
                     let rva = u32::from_le_bytes(bytes.try_into().unwrap());
                     if self.executable_sections().any(|s| s.contains_rva(rva)) {
                         targets.insert(rva);
                     }
                 }
-                if let Some(bytes) = data.get(at..at + 8).filter(|_| at + 8 <= range.end) {
+                if let Some(bytes) = data.get(at..at + 8).filter(|_| scan(8)) {
                     if let Some(rva) = u64::from_le_bytes(bytes.try_into().unwrap())
                         .checked_sub(self.image_base)
                         .and_then(|v| u32::try_from(v).ok())
@@ -350,6 +361,7 @@ impl PeFile {
             image_base,
             entry_rva,
             size_of_image,
+            windows_user_mode: matches!(u16_le(&data, opt + 68)?, 2 | 3),
             checksum_off,
             sections,
             protected: Vec::new(),
@@ -367,6 +379,7 @@ impl PeFile {
             eh_continuations: BTreeSet::new(),
             import_slots: BTreeSet::new(),
             unwind_bytes: Vec::new(),
+            pointer_scan_exclusions: Vec::new(),
             unwind: BTreeMap::new(),
         };
         let directory = |index: usize| -> Result<Option<Range<usize>>> {
@@ -498,7 +511,8 @@ impl PeFile {
                 }
             }
         }
-        if let Some(range) = directory(3)? {
+        let runtime_directory = directory(3)?;
+        if let Some(range) = runtime_directory.clone() {
             if range.len() % 12 != 0 {
                 bail!("malformed exception directory");
             }
@@ -733,11 +747,13 @@ impl PeFile {
                 }
             }
         }
-        let protected = collect_relocations(&data, &layout, directory(5)?)?;
+        let relocation_directory = directory(5)?;
+        let protected = collect_relocations(&data, &layout, relocation_directory.clone())?;
         Ok(PeFile {
             data,
             layout: PeLayout {
                 protected,
+                pointer_scan_exclusions: runtime_directory.into_iter().chain(relocation_directory).collect(),
                 runtime_functions,
                 unwind,
                 code_roots,

@@ -35,12 +35,8 @@ pub struct JunkConfig {
     pub trailing: bool,
 }
 
-/// Canonical never-faulting filler: multi-byte `nop` forms (which do not
-/// access memory), `int3`, and inert segment prefixes. Filler is placed only
-/// where control cannot reach, so any byte pattern would be safe, but keeping
-/// every filler a valid instruction keeps linear disassembly and the encoder
-/// verification meaningful. The templates avoid RIP-relative operands so a
-/// filler decodes identically at any address.
+/// Decodable filler for unreachable gaps. The NOP and `int3` templates avoid
+/// RIP-relative operands so verification can decode them at any address.
 const JUNK: &[&[u8]] = &[
     &[0x90],
     &[0x90],
@@ -84,7 +80,27 @@ pub fn encode_function(
     order: &[usize],
     data: &[u8],
     lead: usize,
+    junk: Option<(&mut dyn RngCore, JunkConfig)>,
+) -> Result<EncodedFunction> {
+    encode_function_with_padding(
+        func, new_ip, order, data, lead, junk,
+        PaddingPlan { sites: &BTreeSet::new(), compact: false },
+    )
+}
+
+struct PaddingPlan<'a> {
+    sites: &'a BTreeSet<u32>,
+    compact: bool,
+}
+
+fn encode_function_with_padding(
+    func: &Function,
+    new_ip: u64,
+    order: &[usize],
+    data: &[u8],
+    lead: usize,
     mut junk: Option<(&mut dyn RngCore, JunkConfig)>,
+    padding: PaddingPlan<'_>,
 ) -> Result<EncodedFunction> {
     if order.first() != Some(&0)
         || order.len() != func.blocks.len()
@@ -93,7 +109,6 @@ pub fn encode_function(
         bail!("invalid block permutation");
     }
     let mut instructions = Vec::new();
-    let mut synthetic = BTreeSet::new();
     let mut synthetic_origins = BTreeMap::new();
     let mut junk_bytes = BTreeMap::<u64, &'static [u8]>::new();
     let mut next_synthetic = u64::MAX;
@@ -108,18 +123,31 @@ pub fn encode_function(
     // receives any.
     let mut dead = false;
     let mut junk_count = 0usize;
+    let reserve_ip = |next: &mut u64| {
+        while used_ips.contains(next) {
+            *next -= 1;
+        }
+        let ip = *next;
+        *next -= 1;
+        ip
+    };
+    let mut emit_jump =
+        |instructions: &mut Vec<Instruction>, next: &mut u64, target: u64, origin: u64| {
+            let mut jump = Instruction::with_branch(Code::Jmp_rel32_64, target)?;
+            jump.set_ip(reserve_ip(next));
+            synthetic_origins.insert(jump.ip(), origin);
+            instructions.push(jump);
+            Ok::<_, anyhow::Error>(())
+        };
     let emit_junk = |instructions: &mut Vec<Instruction>,
                      junk_bytes: &mut BTreeMap<u64, &[u8]>,
                      next_synthetic: &mut u64,
                      rng: &mut dyn RngCore|
      -> usize {
         let mut inserted = 0;
-        for bytes in junk_gap(rng) {
-            while used_ips.contains(next_synthetic) {
-                *next_synthetic -= 1;
-            }
-            let ip = *next_synthetic;
-            *next_synthetic -= 1;
+        let templates = if padding.compact { vec![JUNK[0]] } else { junk_gap(rng) };
+        for bytes in templates {
+            let ip = reserve_ip(next_synthetic);
             junk_bytes.insert(ip, bytes);
             instructions.push(
                 Decoder::with_ip(64, bytes, ip, DecoderOptions::NONE).decode(),
@@ -130,7 +158,7 @@ pub fn encode_function(
     };
     for (position, &bi) in order.iter().enumerate() {
         let block = &func.blocks[bi];
-        if dead && position >= lead {
+        if dead && position >= lead && !padding.compact {
             if let Some((rng, config)) = junk.as_mut() {
                 if rng.gen_bool(config.probability) {
                     junk_count +=
@@ -138,7 +166,17 @@ pub fn encode_function(
                 }
             }
         }
-        instructions.extend(block.instrs.iter().map(|i| i.iced));
+        for ins in &block.instrs {
+            if let Some((rng, config)) = junk.as_mut() {
+                if padding.sites.contains(&ins.rva) && rng.gen_bool(config.probability) {
+                    let resume = ins.iced.ip();
+                    emit_jump(&mut instructions, &mut next_synthetic, resume, resume)?;
+                    junk_count +=
+                        emit_junk(&mut instructions, &mut junk_bytes, &mut next_synthetic, rng);
+                }
+            }
+            instructions.push(ins.iced);
+        }
         let last = block.instrs.last().context("empty basic block")?;
         dead = !last.falls_through();
         if last.falls_through() {
@@ -156,21 +194,18 @@ pub fn encode_function(
                 Some(next) => next.instrs[0].iced.ip(),
                 None => last.iced.next_ip(),
             };
-            let mut jump = Instruction::with_branch(Code::Jmp_rel32_64, target_ip)?;
-            while used_ips.contains(&next_synthetic) {
-                next_synthetic -= 1;
-            }
-            jump.set_ip(next_synthetic);
-            synthetic.insert(next_synthetic);
-            synthetic_origins.insert(next_synthetic, last.iced.next_ip());
-            next_synthetic -= 1;
-            instructions.push(jump);
+            emit_jump(
+                &mut instructions,
+                &mut next_synthetic,
+                target_ip,
+                last.iced.next_ip(),
+            )?;
             dead = true;
         }
     }
     // Trailing filler after the last terminator. v2 unwind epilogue distances
     // are end-relative, so bodies carrying such metadata keep their end.
-    if dead {
+    if dead && !padding.compact {
         if let Some((rng, config)) = junk.as_mut() {
             if config.trailing && rng.gen_bool(config.probability) {
                 junk_count +=
@@ -312,18 +347,16 @@ pub fn encode_function(
         code: encoded.code_buffer,
         address_map: map
             .into_iter()
-            .filter(|(ip, _)| !synthetic.contains(ip) && !junk_bytes.contains_key(ip))
+            .filter(|(ip, _)| !synthetic_origins.contains_key(ip) && !junk_bytes.contains_key(ip))
             .collect(),
-        inserted_jumps: synthetic.len(),
+        inserted_jumps: synthetic_origins.len(),
         junk: junk_count,
         spans,
     })
 }
 
-/// Whether a byte span contains three consecutive aligned dwords that point
-/// into executable code: the shape of an embedded RVA table (switch dispatch
-/// data). Such tables can be read in place by code the reference analysis
-/// never attributed them to, so their extents must not be scrubbed.
+/// Three consecutive code RVAs can be an unrecognized embedded dispatch
+/// table. Leave the original extent intact when it contains such a run.
 fn contains_embedded_table(data: &[u8], code_rvas: std::ops::Range<u32>) -> bool {
     let mut run = 0;
     for chunk in data.chunks_exact(4) {
@@ -355,14 +388,101 @@ fn layout_interior(pe: &PeLayout, rva: u32) -> bool {
         .any(|f| f.start < rva && rva < f.end)
 }
 
+#[derive(Default)]
+struct LayoutConstraints {
+    adjacent: BTreeSet<u32>,
+    first_stack_restore: BTreeMap<u32, u32>,
+}
+
+fn call_then_breakpoint(pair: &[Instr]) -> bool {
+    pair[0].iced.is_call_near() && pair[1].iced.mnemonic() == Mnemonic::Int3
+}
+
+fn retained_call_sites<'a>(
+    f: &'a Function,
+    index: usize,
+    prologue_end: u32,
+    analysis: &'a Analysis,
+    address_taken: &'a BTreeSet<u32>,
+) -> impl Iterator<Item = &'a Instr> {
+    f.blocks
+        .iter()
+        .flat_map(|b| b.instrs.windows(2))
+        .filter(move |pair| {
+            let call = &pair[0];
+            let range = call.rva..call.rva + call.len as u32;
+            (call_then_breakpoint(pair)
+                || call.iced.is_call_near_indirect() && call.iced.is_ip_rel_memory_operand())
+                && call.len >= 5
+                && !call.pinned
+                && call.rva >= prologue_end.max(f.start_rva + 5)
+                && address_taken.range(range.clone()).next().is_none()
+                && !analysis.references_code_as_data(range.clone())
+                && !analysis.range_externally_referenced(index, call.rva + 1..range.end)
+        })
+        .map(|pair| &pair[0])
+}
+
+/// Split a straight-line run only after a complete instruction and before any
+/// stack restoration. Each split jumps over the filler to the original successor.
+fn padding_sites(
+    f: &Function,
+    prologue_end: u32,
+    constraints: &LayoutConstraints,
+    plain_unwind: bool,
+    compact: bool,
+) -> BTreeSet<u32> {
+    let mut sites = BTreeSet::new();
+    for block in &f.blocks {
+        if constraints.adjacent.contains(&block.start_rva) {
+            continue;
+        }
+        let stop = constraints
+            .first_stack_restore
+            .get(&block.start_rva)
+            .copied()
+            .unwrap_or(block.end_rva);
+        // Start looking after four bytes, then leave at least 16 original
+        // bytes between splits to bound the size and branch overhead.
+        let mut next_site = block.start_rva.saturating_add(4).max(prologue_end);
+        for pair in block.instrs.windows(2) {
+            let resume = &pair[1];
+            if resume.rva > stop {
+                break;
+            }
+            // A returning call may land on the jump. Its frame stays intact
+            // until the jump reaches the first stack-restoring instruction.
+            let flow = pair[0].iced.flow_control();
+            let call = matches!(flow, FlowControl::Call | FlowControl::IndirectCall);
+            let site = if compact {
+                call
+            } else {
+                call_then_breakpoint(pair)
+                    || plain_unwind
+                        && resume.rva >= next_site
+                        && (flow == FlowControl::Next || call)
+            };
+            if resume.rva >= prologue_end && site {
+                sites.insert(resume.rva);
+                if compact {
+                    return sites;
+                }
+                next_site = resume.rva.saturating_add(16);
+            }
+        }
+    }
+    sites
+}
+
 fn eligible(
     analysis: &Analysis,
     pe: &PeLayout,
     f: &Function,
     index: usize,
-    growing: bool,
+    allow_small: bool,
     stale_ok: bool,
-) -> Result<BTreeSet<u32>, &'static str> {
+    keep_entry: bool,
+) -> Result<LayoutConstraints, &'static str> {
     let Some(info) = pe.unwind_info(f.start_rva) else {
         return Err("missing runtime metadata");
     };
@@ -418,10 +538,10 @@ fn eligible(
     if f.end_rva - f.start_rva < 5 {
         return Err("entry smaller than jump");
     }
-    if !growing && f.blocks.len() < 3 {
+    if !allow_small && f.blocks.len() < 3 {
         return Err("too few blocks to shuffle");
     }
-    if !analysis.interior_movable(index, f.start_rva + 1..f.end_rva, stale_ok) {
+    if !keep_entry && !analysis.interior_movable(index, f.start_rva + 1..f.end_rva, stale_ok) {
         return Err("interior code reference");
     }
     let boundaries: BTreeSet<_> = f.blocks.iter().map(|b| b.start_rva).collect();
@@ -534,7 +654,10 @@ fn eligible(
                     // through a retargetable near-form branch that the commit
                     // phase rewrites.
                     let entry = pe.runtime_functions.iter().any(|f| f.start == target);
-                    if !entry && !Analysis::retargetable(ins) {
+                    let can_widen = stale_ok
+                        && (target < f.start_rva || target >= f.end_rva)
+                        && (ins.iced.is_jcc_short() || ins.iced.is_jmp_short());
+                    if !entry && !Analysis::retargetable(ins) && !can_widen {
                         return Err("branch outside local blocks");
                     }
                 }
@@ -578,7 +701,7 @@ fn eligible(
     // Every RSP-restoring sequence must end in a terminator, possibly after
     // running through fall-through successor blocks. Those successors are
     // pinned adjacent so the epilogue bytes stay contiguous for the unwinder.
-    let mut pins = BTreeSet::new();
+    let mut constraints = LayoutConstraints::default();
     let epilogue_end = |last: &Instr, f: &Function, pe: &PeLayout, boundaries: &BTreeSet<u32>| {
         last.iced.mnemonic() == Mnemonic::Ret
             || import_tail(&last.iced, pe)
@@ -600,6 +723,11 @@ fn eligible(
                 || Analysis::retargetable(last)))
     };
     for &(block_index, start) in &rsp_writes {
+        let block = &f.blocks[block_index];
+        constraints
+            .first_stack_restore
+            .entry(block.start_rva)
+            .or_insert(block.instrs[start].rva);
         let mut ok = false;
         let mut current = block_index;
         let mut cursor = start;
@@ -629,7 +757,7 @@ fn eligible(
                 break;
             }
             if last.falls_through() && current + 1 < f.blocks.len() {
-                pins.insert(f.blocks[current + 1].start_rva);
+                constraints.adjacent.insert(f.blocks[current + 1].start_rva);
                 current += 1;
                 cursor = 0;
             } else {
@@ -645,7 +773,7 @@ fn eligible(
     // jumps back to the original successor address in encode_function. A live
     // fall-through into trimmed padding is impossible: the reachability
     // analysis marks every fall-through successor as live.
-    Ok(pins)
+    Ok(constraints)
 }
 
 /// Behavior switches for the relocation pass beyond plain block shuffling.
@@ -676,6 +804,18 @@ pub fn run_with_segments(
     segments: Option<&super::segment_inject::Config>,
     options: Options,
 ) -> Result<Counters> {
+    run_with_alias_state(analysis, pe, probability, rng, segments, options, false)
+}
+
+pub(crate) fn run_with_alias_state(
+    analysis: &Analysis,
+    pe: &mut PeFile,
+    probability: f64,
+    rng: &mut impl Rng,
+    segments: Option<&super::segment_inject::Config>,
+    options: Options,
+    aliased_in_place: bool,
+) -> Result<Counters> {
     let mut c = Counters::default();
     if (probability == 0.0 && segments.is_none()) || pe.layout().runtime_functions.is_empty() {
         // Filler lives inside relocated bodies: without block relocation
@@ -691,11 +831,12 @@ pub fn run_with_segments(
             || analysis.functions.iter().any(|f| !f.jump_tables.is_empty()),
     )?;
     let layout = pe.layout();
-    let table_bytes: Vec<_> = analysis
+    let mut table_bytes: Vec<_> = analysis
         .functions
         .iter()
         .flat_map(|f| f.jump_tables.iter().map(|t| t.bytes.clone()))
         .collect();
+    table_bytes.sort_unstable_by_key(|r| r.start);
     let mut address_taken = layout.relocated_code_references_except(&pe.data, &table_bytes);
     address_taken.extend(layout.code_roots.iter().copied());
     address_taken.extend(
@@ -717,23 +858,44 @@ pub fn run_with_segments(
     let mut entries = Vec::new();
     let mut generated_unwind = BTreeMap::new(); // entry begin -> generated unwind RVA
     let mut patches = Vec::new();
+    let mut retained_call_patches = Vec::new();
+    let mut kept_entries = Vec::new();
     let mut wipes = Vec::new();
-    let mut wiped_ranges = Vec::new();
     let mut continuation_updates = BTreeMap::new();
     let mut global_map = BTreeMap::new();
+    let allow_small = segments.is_some() || (probability > 0.0 && options.junk_probability > 0.0);
+    let stale_ok = plan.retains_original_bodies();
+    let code_rvas = layout
+        .executable_sections()
+        .map(|s| s.virtual_address)
+        .min()
+        .unwrap_or(0)
+        ..layout
+            .executable_sections()
+            .map(|s| s.virtual_address.saturating_add(s.virtual_size))
+            .max()
+            .unwrap_or(0);
     for (index, f) in analysis.functions.iter().enumerate() {
-        let stale_ok = plan.retains_original_bodies();
-        let eligibility = eligible(analysis, layout, f, index, segments.is_some(), stale_ok).and_then(|pins| {
-            if address_taken
+        let entry_address_taken = address_taken
                 .range(f.start_rva + 1..f.end_rva)
-                .any(|target| !stale_ok || *target < f.start_rva + 5)
-            {
+                .any(|target| !stale_ok || *target < f.start_rva + 5);
+        let keep_entry = stale_ok
+            && options.wipe_original
+            && options.junk_probability > 0.0
+            && f.jump_tables.is_empty()
+            && (entry_address_taken || !analysis.interior_movable(index, f.start_rva + 1..f.end_rva, true))
+            && layout.unwind_info(f.start_rva).is_some_and(|info| {
+                info.permits_register_reordering
+                    && retained_call_sites(f, index, info.prologue_end, analysis, &address_taken).next().is_some()
+            });
+        let eligibility = eligible(analysis, layout, f, index, allow_small, stale_ok, keep_entry).and_then(|pins| {
+            if entry_address_taken && !keep_entry {
                 Err("interior address taken")
             } else {
                 Ok(pins)
             }
         });
-        let pins = match eligibility {
+        let constraints = match eligibility {
             Ok(pins) => pins,
             Err(reason) => {
                 *c.skipped_reasons.entry(reason).or_default() += 1;
@@ -741,37 +903,36 @@ pub fn run_with_segments(
             }
         };
         c.candidates += 1;
-        // A retained original body may only be scrubbed when nothing can
-        // still reference its interior: every foreign edge must be
-        // re-encodable (the commit phase rewrites it) and no data value may
-        // point inside. The stale-reference relaxation that lets other
-        // functions relocate does not apply here.
-        let can_wipe = options.wipe_original
-            && stale_ok
-            && analysis.interior_movable(index, f.start_rva + 1..f.end_rva, false)
-            && address_taken
-                .range(f.start_rva + 1..f.end_rva)
-                .next()
-                .is_none()
-            && !contains_embedded_table(
-                &pe.data[f.off..f.off + (f.end_rva - f.start_rva) as usize],
-                {
-                    let secs: Vec<_> = layout.executable_sections().collect();
-                    let start = secs.iter().map(|s| s.virtual_address).min().unwrap_or(0);
-                    let end = secs
-                        .iter()
-                        .map(|s| s.virtual_address.saturating_add(s.virtual_size))
-                        .max()
-                        .unwrap_or(0);
-                    start..end
-                },
-            );
         let mut expanded = f.clone();
+        // Keep a cold tail reached by a live foreign branch. The main entry
+        // returns before the tail, so local reachability cannot discover it.
+        if let Some((tail, before)) = expanded.blocks.split_last_mut() {
+            if tail.instrs.len() == 2
+                && call_then_breakpoint(&tail.instrs)
+                && tail.instrs.iter().all(|ins| ins.dead && !layout.is_protected(ins.off..ins.off + ins.len))
+                && before.last().and_then(|b| b.instrs.last()).is_some_and(|ins| !ins.dead && !ins.falls_through())
+                && analysis.branch_sources.get(&tail.start_rva).is_some_and(|sources| {
+                    sources.iter().any(|(owner, ins)| *owner != index && !ins.dead && !ins.pinned)
+                })
+            {
+                for ins in &mut tail.instrs {
+                    ins.dead = false;
+                    ins.pinned = layout.metadata_pinned.iter().any(|r| r.contains(&ins.rva));
+                }
+            }
+        }
         expanded.trim_dead_tail();
         let block_count = expanded.blocks.len();
-        let shuffle = rng.gen::<f64>() < probability && block_count >= 3;
+        let selected = rng.gen::<f64>() < probability;
+        let shuffle = selected && block_count >= 3;
+        // Small functions can still be diversified by padding unreachable gaps.
+        let pad_only = selected && options.junk_probability > 0.0;
         // Leading blocks the prologue spans; filler never enters them.
         let prologue_end = layout.unwind_info(f.start_rva).unwrap().prologue_end;
+        let fixed_order = expanded.blocks.iter().flat_map(|b| &b.instrs).any(|ins| {
+            ins.rva < prologue_end && ins.iced.is_jcc_short()
+                && ins.branch_target_rva(layout.image_base).is_some_and(|t| (prologue_end..f.end_rva).contains(&t))
+        });
         let lead = expanded
             .blocks
             .iter()
@@ -796,9 +957,9 @@ pub fn run_with_segments(
                 }
             }
         }
-        if !shuffle && prefixed == 0 {
+        if !shuffle && prefixed == 0 && !pad_only {
             *c.skipped_reasons
-                .entry("probability or no prefix selected")
+                .entry("no layout change selected")
                 .or_default() += 1;
             continue;
         }
@@ -808,7 +969,7 @@ pub fn run_with_segments(
             .checked_add(offset)
             .context("relayout RVA overflow")?;
         let mut order: Vec<_> = (0..block_count).collect();
-        if shuffle {
+        if shuffle && !fixed_order {
             // Adjacency constraints: blocks the prologue spans, and blocks an
             // epilogue continues into, must stay adjacent and in their original
             // relative order. The shuffle permutes whole constraint groups.
@@ -816,7 +977,7 @@ pub fn run_with_segments(
             for k in 0..lead.saturating_sub(1) {
                 next_pin[k] = true;
             }
-            for start in &pins {
+            for start in &constraints.adjacent {
                 if let Some(k) = expanded
                     .blocks
                     .iter()
@@ -860,6 +1021,33 @@ pub fn run_with_segments(
             order = shuffled;
         }
         let info = layout.unwind_info(f.start_rva).unwrap();
+        // Both immediate widths encode the same ADD and are valid version-1
+        // epilogues. Preserve version-2 epilogue sizes and prologue offsets.
+        let mut widened_stack_restores = 0;
+        if info.v2.is_none() && options.alias_probability > 0.0 {
+            for ins in expanded.blocks.iter_mut().flat_map(|b| &mut b.instrs) {
+                if ins.rva >= prologue_end
+                    && ins.iced.code() == Code::Add_rm64_imm8
+                    && ins.iced.op0_register() == Register::RSP
+                    && rng.gen_bool(options.alias_probability)
+                {
+                    let value = ins.iced.immediate8to64();
+                    ins.iced.set_code(Code::Add_rm64_imm32);
+                    ins.iced.set_op1_kind(iced_x86::OpKind::Immediate32to64);
+                    ins.iced.set_immediate32to64(value);
+                    widened_stack_restores += 1;
+                }
+            }
+        }
+        // Version-1 plain unwind records describe the unchanged prologue.
+        // Keep the existing gap-only behavior for handler and chain records
+        // and for version-2 unwind records with explicit epilogue extents.
+        let sites = if options.junk_probability > 0.0 && info.v2.is_none() {
+            let plain = info.permits_register_reordering || matches!(info.kind, crate::pe::UnwindKind::Chained { .. });
+            padding_sites(&expanded, prologue_end, &constraints, plain, fixed_order)
+        } else {
+            BTreeSet::new()
+        };
         let junk = (options.junk_probability > 0.0).then(|| {
             (
                 &mut *rng as &mut dyn RngCore,
@@ -871,14 +1059,22 @@ pub fn run_with_segments(
                 },
             )
         });
-        let mut encoded = match encode_function(&expanded, layout.va(rva), &order, &pe.data, lead, junk)
-        {
+        let mut encoded = match encode_function_with_padding(
+            &expanded, layout.va(rva), &order, &pe.data, lead, junk,
+            PaddingPlan { sites: &sites, compact: fixed_order },
+        ) {
             Ok(encoded) => encoded,
             Err(_) => {
                 c.reverted += 1;
                 continue;
             }
         };
+        if !shuffle && prefixed == 0 && encoded.junk == 0 {
+            *c.skipped_reasons
+                .entry("no layout change selected")
+                .or_default() += 1;
+            continue;
+        }
         let prologue_len = (info.prologue_end - f.start_rva) as usize;
         // The prologue must keep instruction boundaries and register-saving
         // effects so unwind code offsets stay valid. Bytes may differ only
@@ -1060,7 +1256,11 @@ pub fn run_with_segments(
         if !exception_bytes.is_empty() {
             generated_unwind.insert(rva, unwind_rva);
         }
-        patches.push((f.off, jump));
+        if keep_entry {
+            kept_entries.push(f.start_rva..f.end_rva);
+        } else {
+            patches.push((f.off, jump));
+        }
         global_map.extend(encoded.address_map.iter().map(|(&a, &b)| (a, b)));
         for &old in layout.eh_continuations.range(f.start_rva..f.end_rva) {
             let target = encoded
@@ -1072,17 +1272,22 @@ pub fn run_with_segments(
         entries.push((rva, end, unwind_rva));
         // Inter-function padding is unreachable dead space: random bytes there
         // break end-of-function signatures just like the in-body filler.
-        // Aliasing runs last on the final code buffer: prologue validation
-        // and unwind/v2 relocation already accepted these bytes, and aliasing
-        // only swaps equivalent opcode forms at identical instruction
-        // boundaries, so every downstream consumer (offsets, spans, address
-        // map, wipe extents) stays valid while the byte stream changes.
+        // The encoder preserves byte-exact aliases from the in-place pass.
+        // Only offer a fresh alias to copies whose source was skipped there.
         if options.alias_probability > 0.0 {
+            let pinned_ips: BTreeSet<_> = expanded
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instrs)
+                .filter(|ins| ins.pinned && !analysis.pinned_only_by_unwind(ins))
+                .map(|ins| ins.iced.ip())
+                .collect();
             let new_ip = layout.va(rva);
-            for (_, span) in &encoded.spans {
+            for (source, span) in &encoded.spans {
                 let start = (span.start - new_ip) as usize;
                 let end = (span.end - new_ip) as usize;
                 if rng.gen::<f64>() < options.alias_probability
+                    && (!aliased_in_place || pinned_ips.contains(source))
                     && super::alias_in_place(&mut encoded.code[start..end], span.start)
                 {
                     c.aliases += 1;
@@ -1101,39 +1306,62 @@ pub fn run_with_segments(
         }
         c.applied += 1;
         c.junk_inserted += encoded.junk as u64;
-        if can_wipe {
-            // Scrub the retained body, but spare jump-table bytes: tables are
-            // live data rewritten in place (sometimes the table is the whole
-            // runtime extent), and wiping them would corrupt dispatches.
-            let mut spans = vec![(f.off + 5, (f.end_rva - f.start_rva) as usize - 5)];
-            let wipe_end = f.off + (f.end_rva - f.start_rva) as usize;
-            for table in analysis.functions.iter().flat_map(|g| &g.jump_tables) {
-                if table.bytes.start >= wipe_end || table.bytes.end <= f.off + 5 {
+        c.aliases += widened_stack_restores;
+        let body_end = f.off + (f.end_rva - f.start_rva) as usize;
+        let interior = f.start_rva + 1..f.end_rva;
+        let first_wipe = wipes.len();
+        if options.wipe_original
+            && stale_ok
+            && !keep_entry
+            && analysis.interior_movable(index, interior.clone(), false)
+            && address_taken.range(interior.clone()).next().is_none()
+            // A re-encodable edge must also have a destination in the emitted
+            // copy. Trimmed padding and interior bytes of instructions do not.
+            && analysis.branch_sources.range(interior.clone()).all(|(&target, sources)| {
+                sources.iter().all(|(owner, _)| *owner == index)
+                    || encoded.address_map.contains_key(&layout.va(target))
+            })
+            && analysis.address_references.range(interior).all(|(&target, _)| {
+                encoded.address_map.contains_key(&layout.va(target))
+            })
+            && !contains_embedded_table(&pe.data[f.off..body_end], code_rvas.clone())
+        {
+            // Keep the trampoline and the data used by in-place dispatch.
+            let first = wipes.len();
+            let mut start = f.off + 5;
+            for table in table_bytes.iter().take_while(|t| t.start < body_end) {
+                if table.end <= start {
                     continue;
                 }
-                spans = spans
-                    .into_iter()
-                    .flat_map(|(at, len)| {
-                        let end = at + len;
-                        let t0 = table.bytes.start.max(at);
-                        let t1 = table.bytes.end.min(end);
-                        if t0 >= t1 {
-                            return vec![(at, len)];
-                        }
-                        let mut out = Vec::new();
-                        if t0 > at {
-                            out.push((at, t0 - at));
-                        }
-                        if end > t1 {
-                            out.push((t1, end - t1));
-                        }
-                        out
-                    })
-                    .collect();
+                if start < table.start {
+                    wipes.push((start, table.start - start));
+                }
+                start = table.end.min(body_end);
             }
-            wipes.extend(spans);
-            wiped_ranges.push((f.start_rva, f.end_rva));
-            c.wiped_original += 1;
+            if start < body_end {
+                wipes.push((start, body_end - start));
+            }
+            if wipes.len() > first {
+                c.wiped_original += 1;
+                c.original_bytes_wiped += wipes[first..].iter().map(|&(_, len)| len as u64).sum::<u64>();
+            }
+        }
+        if stale_ok && options.wipe_original && options.junk_probability > 0.0 {
+            // A retained cold path can transfer to its exact mapped call.
+            // The copied CALL still creates the return address and runs under
+            // the relocated function's corresponding unwind and EH metadata.
+            for call in retained_call_sites(&expanded, index, prologue_end, analysis, &address_taken) {
+                if wipes[first_wipe..].iter().any(|&(at, len)| at < call.off + call.len && call.off < at + len) {
+                    continue;
+                }
+                let Some(&target) = encoded.address_map.get(&call.iced.ip()) else { continue };
+                let Ok(disp) = i32::try_from(target as i128 - (call.iced.ip() + 5) as i128) else { continue };
+                let mut jump = vec![0xE9];
+                jump.extend_from_slice(&disp.to_le_bytes());
+                jump.resize(call.len, 0xCC);
+                retained_call_patches.push((call.off, jump));
+                c.redirected_original_calls += 1;
+            }
         }
         c.relocated_c_specific += u64::from(layout.c_specific.contains_key(&f.start_rva));
         if let Some(cpp) = layout.cpp_eh.get(&f.start_rva) {
@@ -1161,7 +1389,7 @@ pub fn run_with_segments(
         for (&old_target, sources) in &analysis.address_references {
             // Preserve function-pointer identity and existing CFG entry tables.
             // The stable entry trampoline already reaches the relocated body.
-            if layout
+            if kept_entries.iter().any(|range| range.contains(&old_target)) || layout
                 .runtime_functions
                 .iter()
                 .any(|f| f.start == old_target)
@@ -1201,7 +1429,7 @@ pub fn run_with_segments(
         // same treatment: the displacement is rewritten to the new address in
         // both the original bytes and the relocated copy of the source.
         for (&old_target, sources) in &analysis.branch_sources {
-            if layout
+            if kept_entries.iter().any(|range| range.contains(&old_target)) || layout
                 .runtime_functions
                 .iter()
                 .any(|f| f.start == old_target)
@@ -1282,9 +1510,9 @@ pub fn run_with_segments(
                 // Stale targets stay valid only where the original bytes
                 // survive; scrubbed bodies must not keep table entries.
                 targets.extend(layout.eh_continuations.iter().copied().filter(|r| {
-                    !wiped_ranges
-                        .iter()
-                        .any(|(start, end)| *r > *start && *r < *end)
+                    layout.rva_to_offset(*r).is_none_or(|off| {
+                        !wipes.iter().any(|&(start, len)| (start..start + len).contains(&off))
+                    })
                 }));
             }
             targets.sort_unstable();
@@ -1317,6 +1545,7 @@ pub fn run_with_segments(
                 metadata_patches.push((table.start, bytes));
             }
         }
+        metadata_patches.extend(retained_call_patches);
         plan.commit_with_metadata(
             pe,
             payload,

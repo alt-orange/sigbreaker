@@ -38,7 +38,7 @@ impl SegmentName {
     long_about = "SigBreaker experimentally diversifies x86-64 PE binaries \
 with transformations intended to preserve behavior:\n\
   - segment selector injection (configurable whitelist, FS/GS off by default)\n\
-  - opcode aliasing of register-register ALU/MOV (MR/RM direction-bit forms)\n\
+  - equivalent encodings for selected instructions and relocated stack restores\n\
   - DAG-based instruction reordering inside basic blocks\n\
   - basic block shuffling with explicit control-flow patching\n\n\
 Supported functions grow in .text or an appended section. Existing data RVAs \
@@ -79,12 +79,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0)]
     pub reorder_prob: f64,
 
-    /// Probability [0, 1] of relocating eligible blocks or shuffling block chains.
+    /// Probability [0, 1] of relocating eligible functions for block shuffling
+    /// or unreachable padding, or shuffling block chains in place.
     #[arg(long, default_value_t = 1.0)]
     pub shuffle_prob: f64,
 
-    /// Probability [0, 1] of padding each unreachable gap in a relocated body
-    /// with inert junk code (multi-byte nops, int3 and segment prefixes).
+    /// Probability [0, 1] of adding unreachable filler at each eligible site
+    /// in a relocated body, including jump-protected straight-line splits.
     #[arg(long, default_value_t = 1.0)]
     pub junk_prob: f64,
 
@@ -94,8 +95,7 @@ pub struct Cli {
     #[arg(long)]
     pub wipe_original: bool,
 
-    /// Probability [0, 1] of rewriting an eligible register-register ALU/MOV
-    /// instruction into its equivalent reversed-operand opcode form.
+    /// Probability [0, 1] of using an equivalent encoding for an eligible instruction.
     #[arg(long, default_value_t = 1.0)]
     pub alias_prob: f64,
 
@@ -119,7 +119,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_alias: bool,
 
-    /// Disable basic block shuffling.
+    /// Disable block shuffling and relocation solely for unreachable padding.
     #[arg(long)]
     pub no_shuffle: bool,
 

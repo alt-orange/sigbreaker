@@ -106,6 +106,133 @@ fn bounded_absolute_rva_and_relative_jump_tables_follow_relocated_cases() {
 }
 
 #[test]
+fn wipe_ignores_relocation_records_but_preserves_fixup_targets() {
+    for keep_body in [false, true] {
+        let mut data = fixture().data;
+        // The pair of 16-bit relocation entries looks like the code RVA
+        // 0x100a to an untyped scan. The separate DIR64 fixup is a real pointer.
+        data[0xF4..0xF8].copy_from_slice(&16u32.to_le_bytes());
+        data[0xC04..0xC10].copy_from_slice(&[16, 0, 0, 0, 0x0A, 0x10, 0, 0, 0x20, 0xA0, 0, 0]);
+        if keep_body {
+            data[0x820..0x828].copy_from_slice(&0x14000100Au64.to_le_bytes());
+        }
+        // A symbol map forces the append strategy without changing the code.
+        let mut pe = PeFile::parse_with_symbols(data.clone(), [(0x1000, "entry".into())].into())
+            .unwrap();
+        let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+        let c = relayout::run_with_segments(
+            &a,
+            &mut pe,
+            1.0,
+            &mut StdRng::seed_from_u64(42),
+            None,
+            relayout::Options {
+                wipe_original: true,
+                ..relayout::Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.applied, 1);
+        assert_eq!(pe.layout().sections.last().unwrap().name(), ".sbrk");
+        let old = pe.layout().rva_to_offset(0x1000).unwrap();
+        assert_eq!(pe.data[old], 0xE9);
+        if keep_body {
+            assert_eq!(c.original_bytes_wiped, 0);
+            assert_eq!(&pe.data[old + 5..old + 16], &data[0x405..0x410]);
+        } else {
+            assert_eq!(c.wiped_original, 1);
+            assert_eq!(c.original_bytes_wiped, 11);
+            assert_eq!(&pe.data[old + 5..old + 16], &[0xCC; 11]);
+        }
+    }
+}
+
+#[test]
+fn wipe_preserves_a_foreign_branch_target_trimmed_from_the_copy() {
+    let code = [
+        0x85, 0xC9, 0x74, 6, 0xB8, 1, 0, 0, 0, 0xC3, 0xB8, 2, 0, 0, 0, 0xC3,
+        0xB8, 3, 0, 0, 0, 0xC3,
+    ];
+    let mut data = fixture_code(&code).data;
+    for (at, value) in [(0xE4, 24u32), (0x84C, 0x1080), (0x850, 0x1085), (0x854, 0x2090)] {
+        data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    data[0x890] = 1;
+    data[0x480..0x485].copy_from_slice(&[0xE9, 0x8B, 0xFF, 0xFF, 0xFF]); // jmp 0x1010
+    let mut pe = PeFile::parse_with_symbols(data, [(0x1000, "entry".into())].into()).unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    assert!(a.functions[0].blocks.last().unwrap().instrs[0].dead);
+    let c = relayout::run_with_segments(
+        &a,
+        &mut pe,
+        1.0,
+        &mut StdRng::seed_from_u64(42),
+        None,
+        relayout::Options {
+            wipe_original: true,
+            ..relayout::Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(c.applied, 1);
+    assert_eq!(c.wiped_original, 0);
+    let old = pe.layout().rva_to_offset(0x1000).unwrap();
+    assert_eq!(pe.data[old], 0xE9);
+    assert_eq!(&pe.data[old + 5..old + code.len()], &code[5..]);
+}
+
+#[test]
+fn retained_entry_can_route_a_proven_call_site_to_its_copy() {
+    let code = [
+        0x48, 0x83, 0xEC, 0x28, 0x90, // sub rsp, 40; nop
+        0xE8, 0x76, 0, 0, 0, 0xCC, // call 0x1080; int3
+        0x48, 0x83, 0xC4, 0x28, 0xC3, // add rsp, 40; ret
+    ];
+    for call_is_address_taken in [false, true] {
+        let mut data = fixture_code(&code).data;
+        data[0x880..0x888].copy_from_slice(&[1, 4, 1, 0, 4, 0x42, 0, 0]);
+        data[0x480] = 0xC3;
+        data[0x820..0x824].copy_from_slice(&0x1001u32.to_le_bytes());
+        if call_is_address_taken {
+            data[0x824..0x828].copy_from_slice(&0x1005u32.to_le_bytes());
+        }
+        let mut pe = PeFile::parse_with_symbols(data, [(0x1000, "entry".into())].into()).unwrap();
+        let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+        let c = relayout::run_with_segments(
+            &a,
+            &mut pe,
+            1.0,
+            &mut StdRng::seed_from_u64(42),
+            None,
+            relayout::Options {
+                junk_probability: 1.0,
+                wipe_original: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let layout = pe.layout();
+        let entry = layout.rva_to_offset(0x1000).unwrap();
+        assert_eq!(&pe.data[entry..entry + 5], &code[..5]);
+        assert_eq!(c.wiped_original, 0);
+        if call_is_address_taken {
+            assert_eq!(c.redirected_original_calls, 0);
+            assert_eq!(&pe.data[entry..entry + code.len()], &code);
+            continue;
+        }
+        assert_eq!(c.redirected_original_calls, 1);
+        let jump = Decoder::with_ip(64, &pe.data[entry + 5..], layout.va(0x1005), DecoderOptions::NONE)
+            .decode();
+        assert_eq!(jump.mnemonic(), Mnemonic::Jmp);
+        let target = jump.near_branch_target();
+        let offset = layout.rva_to_offset((target - layout.image_base) as u32).unwrap();
+        let call = Decoder::with_ip(64, &pe.data[offset..], target, DecoderOptions::NONE).decode();
+        assert_eq!(call.mnemonic(), Mnemonic::Call);
+        assert_eq!(call.near_branch_target(), layout.va(0x1080));
+    }
+}
+
+#[test]
 fn opaque_metadata_fallback_expands_headers_and_preserves_rvas_and_overlay() {
     let mut data = fixture().data;
     // A second region has an unknown language handler. It must remain intact.
@@ -595,6 +722,132 @@ fn growing_prefixes_support_one_and_two_blocks_and_preserve_results() {
             assert_eq!(eax, value.wrapping_mul(2));
         }
     }
+}
+
+#[test]
+fn unreachable_padding_diversifies_short_functions_without_segment_prefixes() {
+    for (code, block_count) in [
+        (&[0xB8, 42, 0, 0, 0, 0xC3][..], 1),
+        (&[0xEB, 0, 0xB8, 42, 0, 0, 0, 0xC3][..], 2),
+    ] {
+        for (shuffle_prob, junk_prob, expected) in [(1.0, 0.0, 0), (0.0, 1.0, 0), (1.0, 1.0, 1)] {
+            let mut pe = fixture_code(code);
+            let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+            assert_eq!(a.functions[0].blocks.len(), block_count);
+            let snapshot = pe.data.clone();
+            let c = relayout::run_with_segments(
+                &a,
+                &mut pe,
+                shuffle_prob,
+                &mut StdRng::seed_from_u64(42),
+                None,
+                relayout::Options {
+                    junk_probability: junk_prob,
+                    ..relayout::Options::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(c.applied, expected);
+            if expected == 0 {
+                assert_eq!(pe.data, snapshot);
+                continue;
+            }
+
+            assert!(c.junk_inserted > 0);
+            let layout = pe.layout();
+            let entry = Decoder::with_ip(64, &pe.data[0x400..], layout.va(0x1000), DecoderOptions::NONE)
+                .decode();
+            assert_eq!(entry.mnemonic(), Mnemonic::Jmp);
+            let mut ip = entry.near_branch_target();
+            let relocated = layout.runtime_functions.last().unwrap();
+            assert_eq!(ip, layout.va(relocated.start));
+            let decode = |ip| {
+                let off = layout.rva_to_offset((ip - layout.image_base) as u32).unwrap();
+                Decoder::with_ip(64, &pe.data[off..], ip, DecoderOptions::NONE).decode()
+            };
+            if block_count == 2 {
+                let branch = decode(ip);
+                assert_eq!(branch.mnemonic(), Mnemonic::Jmp);
+                ip = branch.near_branch_target();
+            }
+            let mov = decode(ip);
+            assert_eq!(mov.mnemonic(), Mnemonic::Mov);
+            assert_eq!(mov.op0_register(), Register::EAX);
+            assert_eq!(mov.immediate32(), 42);
+            let mut ret = decode(mov.next_ip());
+            if ret.mnemonic() == Mnemonic::Jmp {
+                assert!(ret.near_branch_target() > ret.next_ip());
+                ret = decode(ret.near_branch_target());
+            }
+            assert_eq!(ret.mnemonic(), Mnemonic::Ret);
+            assert!(ret.next_ip() < layout.va(relocated.end));
+        }
+    }
+}
+
+#[test]
+fn interior_junk_is_skipped_and_keeps_the_prologue_and_epilogue_contiguous() {
+    let prologue = [0x48, 0x83, 0xEC, 0x28]; // sub rsp, 40
+    let epilogue = [0x48, 0x83, 0xC4, 0x28, 0xC3]; // add rsp, 40; ret
+    let widened_epilogue = [0x48, 0x81, 0xC4, 0x28, 0, 0, 0, 0xC3];
+    let mut code = prologue.to_vec();
+    code.extend([0xB8, 42, 0, 0, 0]); // mov eax, 42
+    for _ in 0..10 {
+        code.extend([0x83, 0xC0, 1]); // add eax, 1
+    }
+    code.extend(epilogue);
+    let mut data = fixture_code(&code).data;
+    data[0x880..0x888].copy_from_slice(&[1, 4, 1, 0, 4, 0x42, 0, 0]);
+    let mut pe = PeFile::parse(data).unwrap();
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    assert_eq!(a.functions[0].blocks.len(), 1);
+    let counters = relayout::run_with_segments(
+        &a,
+        &mut pe,
+        1.0,
+        &mut StdRng::seed_from_u64(42),
+        None,
+        relayout::Options {
+            junk_probability: 1.0,
+            alias_probability: 1.0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(counters.applied, 1);
+
+    let layout = pe.layout();
+    let moved = layout.runtime_functions.last().unwrap();
+    let start = layout.rva_to_offset(moved.start).unwrap();
+    assert_eq!(&pe.data[start..start + prologue.len()], &[0x4A, 0x83, 0xEC, 0x28]);
+    let mut ip = layout.va(moved.start) + prologue.len() as u64;
+    let mut jumps = 0;
+    let mut adds = 0;
+    loop {
+        assert!(ip < layout.va(moved.end));
+        let off = start + (ip - layout.va(moved.start)) as usize;
+        let ins = Decoder::with_ip(64, &pe.data[off..], ip, DecoderOptions::NONE).decode();
+        ip = ins.next_ip();
+        match ins.mnemonic() {
+            Mnemonic::Jmp => {
+                assert!(ins.near_branch_target() > ip);
+                ip = ins.near_branch_target();
+                jumps += 1;
+            }
+            Mnemonic::Mov => assert_eq!(ins.immediate32(), 42),
+            Mnemonic::Add if ins.op0_register() == Register::EAX => adds += 1,
+            Mnemonic::Add if ins.op0_register() == Register::RSP => {
+                assert_eq!(
+                    &pe.data[off..off + widened_epilogue.len()],
+                    &widened_epilogue
+                );
+                break;
+            }
+            _ => panic!("unexpected instruction {ins}"),
+        }
+    }
+    assert!(jumps >= 2);
+    assert_eq!(adds, 10);
 }
 
 #[test]

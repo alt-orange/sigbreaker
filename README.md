@@ -31,7 +31,7 @@ header-only edits, rejected attempts, and reverted transformations are excluded.
 | Area | Implemented support |
 | --- | --- |
 | Prefix injection | Equal-length encodings and expanded eligible functions; ES/CS/SS/DS by default |
-| Opcode aliasing | Register-register ALU/MOV rewritten between MR and RM direction-bit forms at identical length, decode-verified per instruction |
+| Opcode aliasing | Equal-length ALU/MOV direction aliases and unused REX/SIB bits in selected legacy instructions. Relocated version-1 epilogues can widen `add rsp` immediates |
 | Scheduling | Register/flag dependencies, equal-length scalar runs, proven saved nonvolatile registers and private committed stack slots |
 | Exceptions | Named-import C-specific SEH and C++ FH3/FH4; explicit static CRT/GS identities from linker maps |
 | Unwind | Version 1, supported secondary chains with pinned primaries, version-2 explicit epilogue rewriting |
@@ -91,12 +91,14 @@ is distinct from actually relocating its exception-handling functions.
 | `--segments` | `es,cs,ss,ds` | Prefix whitelist |
 | `--reorder-prob` | `1.0` | Scheduling probability |
 | `--shuffle-prob` | `1.0` | Block movement probability |
+| `--junk-prob` | `1.0` | Probability of padding each eligible gap or jump-protected split in relocated code |
 | `--alias-prob` | `1.0` | Opcode alias probability |
 | `--no-grow-segments` | off | Restrict prefixes to original lengths |
 | `--no-seg-inject` | off | Disable prefix injection |
 | `--no-reorder` | off | Disable scheduling |
 | `--no-alias` | off | Disable opcode aliasing |
 | `--no-shuffle` | off | Disable block shuffling |
+| `--wipe-original` | off | Scrub original bodies behind entry jumps when relocation appends a section. With junk enabled, eligible calls in retained bodies can jump to their relocated copies |
 | `--handler-map` | none | Matching linker map for static handlers |
 | `--no-verify` | off | Disable the in-place decode check |
 

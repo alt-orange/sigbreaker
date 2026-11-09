@@ -328,7 +328,7 @@ fn rejects_truncated_exception_directory_and_short_optional_header() {
 
 #[test]
 fn chained_unwind_protects_primary_and_rejects_cycles_and_mismatches() {
-    let mut p = metadata_fixture(&[0x90, 0xC3]);
+    let mut p = metadata_fixture(&[0x90, 0x48, 0x89, 0xC8, 0xC3]);
     p.data[0x410..0x412].copy_from_slice(&[0x90, 0xC3]);
     p.data[0xE4..0xE8].copy_from_slice(&24u32.to_le_bytes());
     for (at, value) in [
@@ -336,20 +336,45 @@ fn chained_unwind_protects_primary_and_rejects_cycles_and_mismatches() {
         (0x850, 0x1012),
         (0x854, 0x2090),
         (0x894, 0x1000),
-        (0x898, 0x1002),
+        (0x898, 0x1005),
         (0x89C, 0x2080),
     ] {
         p.data[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
     p.data[0x890] = 1 | 4 << 3;
     let pe = PeFile::parse(p.data.clone()).unwrap();
-    assert_eq!(pe.layout().metadata_pinned, vec![0x1000..0x1002]);
+    assert_eq!(pe.layout().metadata_pinned, vec![0x1000..0x1005]);
     let a = Analysis::run(pe.layout(), &pe.data).unwrap();
     assert!(a.functions[0]
         .blocks
         .iter()
         .flat_map(|b| &b.instrs)
         .all(|i| i.pinned));
+    let mut aliased = pe.data.clone();
+    let c = sigbraker::transforms::opcode_alias::run(
+        &a,
+        pe.layout(),
+        &mut aliased,
+        &sigbraker::transforms::opcode_alias::Config { probability: 1.0 },
+        &mut StdRng::seed_from_u64(42),
+    );
+    assert_eq!(c.applied, 1);
+    assert_eq!(&aliased[0x400..0x405], &[0x90, 0x48, 0x8B, 0xC1, 0xC3]);
+    let mut with_fixup = p.data.clone();
+    with_fixup[0xC00..0xC04].copy_from_slice(&0x1000u32.to_le_bytes());
+    with_fixup[0xC08..0xC0A].copy_from_slice(&0xA000u16.to_le_bytes());
+    let fixed = PeFile::parse(with_fixup).unwrap();
+    let analysis = Analysis::run(fixed.layout(), &fixed.data).unwrap();
+    let mut aliased = fixed.data.clone();
+    let c = sigbraker::transforms::opcode_alias::run(
+        &analysis,
+        fixed.layout(),
+        &mut aliased,
+        &sigbraker::transforms::opcode_alias::Config { probability: 1.0 },
+        &mut StdRng::seed_from_u64(42),
+    );
+    assert_eq!(c.applied, 0);
+    assert_eq!(aliased, fixed.data);
     let mut mismatch = p.data.clone();
     mismatch[0x89C..0x8A0].copy_from_slice(&0x2084u32.to_le_bytes());
     assert!(PeFile::parse(mismatch).is_err());

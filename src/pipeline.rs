@@ -127,14 +127,15 @@ pub fn run(cli: &Cli) -> Result<String> {
     let lifted = Analysis::run(&layout, &pe.data)?;
     // Pass 3 — opcode aliasing, in place. Runs after reordering so it is the
     // last writer of the in-place bytes.
-    if !cli.no_alias && cli.alias_prob > 0.0 {
+    let alias_in_place = !cli.no_alias && cli.alias_prob > 0.0;
+    if alias_in_place {
         let cfg = opcode_alias::Config {
             probability: cli.alias_prob,
         };
         let c = opcode_alias::run(&lifted, &layout, &mut pe.data, &cfg, &mut rng);
         pass(
             "opcode aliasing",
-            "MR/RM direction-bit aliases of register-register ALU/MOV".into(),
+            "equivalent ALU/MOV forms and unused bits in legacy encodings".into(),
             c,
         );
     }
@@ -152,7 +153,7 @@ pub fn run(cli: &Cli) -> Result<String> {
                 probability: cli.seg_prob,
                 segments: cli.segments.iter().map(|s| s.register()).collect(),
             });
-            let c = relayout::run_with_segments(
+            let c = relayout::run_with_alias_state(
                 &lifted,
                 &mut pe,
                 if cli.no_shuffle {
@@ -167,6 +168,7 @@ pub fn run(cli: &Cli) -> Result<String> {
                     wipe_original: cli.wipe_original,
                     alias_probability: if cli.no_alias { 0.0 } else { cli.alias_prob },
                 },
+                alias_in_place,
             )?;
             pass(
                 "basic block relocation",

@@ -237,6 +237,47 @@ fn defaults_enable_full_coverage_and_growth_can_be_disabled() {
 }
 
 #[test]
+fn relocation_preserves_in_place_opcode_aliases() {
+    let mut pe = TestPe::new().with_code(&[
+        0x48, 0x89, 0x5C, 0x24, 8, // mov [rsp+8], rbx
+        0x48, 0x89, 0xC8, // mov rax, rcx
+        0xC3,
+    ]);
+    for (at, value) in [
+        (0xE0, 0x2040u32),
+        (0xE4, 12),
+        (0x840, 0x1000),
+        (0x844, 0x1009),
+        (0x848, 0x2080),
+    ] {
+        pe.data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    pe.data[0x880..0x888].copy_from_slice(&[1, 5, 2, 0, 5, 0x34, 1, 0]);
+    let exe = TempExe::write(&pe.data);
+    let report = pipeline::run(&exe.cli(&["--no-seg-inject", "--no-reorder"])).unwrap();
+    assert!(report.contains("transformed: 1/1 functions"), "{report}");
+    let bytes = std::fs::read(out_path(&exe.path)).unwrap();
+    let output = sigbraker::pe::PeFile::parse(bytes).unwrap();
+    let layout = output.layout();
+    let entry = layout.rva_to_offset(0x1000).unwrap();
+    assert_eq!(output.data[entry], 0xE9);
+    let moved = layout.runtime_functions.last().unwrap();
+    let start = layout.rva_to_offset(moved.start).unwrap();
+    assert_eq!(&output.data[start..start + 5], &[0x48, 0x89, 0x5C, 0x64, 8]);
+    let jump = Decoder::with_ip(
+        64,
+        &output.data[start + 5..],
+        layout.va(moved.start + 5),
+        DecoderOptions::NONE,
+    )
+    .decode();
+    assert_eq!(jump.mnemonic(), Mnemonic::Jmp);
+    let resume = (jump.near_branch_target() - layout.image_base) as u32;
+    let resume = layout.rva_to_offset(resume).unwrap();
+    assert_eq!(&output.data[resume..resume + 3], &[0x48, 0x8B, 0xC1]);
+}
+
+#[test]
 fn info_mode_writes_nothing() {
     let pe = TestPe::new().with_sample_code();
     let exe = TempExe::write(&pe.data);

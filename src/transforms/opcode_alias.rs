@@ -1,12 +1,8 @@
 //! In-place opcode aliasing.
 //!
-//! Rewrites register-register ALU and MOV instructions into their equivalent
-//! reversed-operand encoding (the MR↔RM forms differ only in opcode bit 1),
-//! changing the opcode byte without changing instruction length, operand
-//! order, flags or effects. This breaks byte signatures that cover opcode
-//! bytes - including the short prologue-anchored signatures that survive
-//! relocation unchanged - while every candidate is self-verified by decoding
-//! the rewritten bytes and comparing them against the original decode.
+//! Switches equivalent register-register ALU/MOV direction forms and changes
+//! unused REX or SIB bits in selected legacy instructions.
+//! Each replacement is checked against the original decode before publication.
 //!
 //! Because the rewrite is strictly in place and length-preserving, it applies
 //! to every lifted function: relocated functions inherit the aliased bytes in
@@ -35,15 +31,22 @@ pub fn run(
     rng: &mut impl Rng,
 ) -> Counters {
     let mut c = Counters::default();
-    for func in &analysis.functions {
+    for (index, func) in analysis.functions.iter().enumerate() {
         for block in &func.blocks {
             for ins in &block.instrs {
-                if ins.pinned {
+                if ins.pinned && !analysis.pinned_only_by_unwind(ins) {
                     c.skipped_pinned += 1;
                     continue;
                 }
                 c.candidates += 1;
                 if rng.gen::<f64>() >= cfg.probability {
+                    continue;
+                }
+                let end = ins.rva + ins.len as u32;
+                if analysis.range_externally_referenced(index, ins.rva + 1..end)
+                    || (ins.pinned && analysis.references_code_as_data(ins.rva..end))
+                {
+                    *c.skipped_reasons.entry("interior code reference").or_default() += 1;
                     continue;
                 }
                 let ip = pe.va(ins.rva);

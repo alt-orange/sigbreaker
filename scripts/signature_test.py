@@ -18,12 +18,9 @@ Classification of every original function in the processed binary:
               appended section (its body was rebuilt elsewhere)
   retained  - the original bytes are still the live entry point
 
-Expected outcome:
-  retained functions still match (nothing was done to them - the known
-  coverage limit), relocated functions must NOT match anywhere anymore,
-  unless their re-encoded copy happens to reproduce the original byte
-  stream byte-for-byte. Matches are therefore counted by location:
-  at the original site, in the appended section, or elsewhere.
+The report counts each detected signature once overall and once per location
+where it matches: its original function span, the appended section, or elsewhere.
+Retained functions can also change through in-place passes.
 
 Usage:
   python scripts/signature_test.py ORIGINAL PROCESSED [--prefix 256]
@@ -153,12 +150,16 @@ def build_signature(img: Image, start: int, end: int, prefix: int) -> Signature 
     off = img.rva_to_off(start)
     if off is None:
         return None
-    blob = img.data[off:off + min(prefix, end - start)]
-    lo, hi = img.image_range()
+    size = min(prefix, end - start)
+    blob = img.data[off:off + size]
+    # Decode through the last instruction that starts in the signature so a
+    # prefix ending inside a displacement still masks the bytes it contains.
+    decode_blob = img.data[off:off + min(size + 14, end - start)]
+    lo, hi = (img.image_base + rva for rva in img.image_range())
     mask = bytearray(len(blob))
     wild = 0
     count = 0
-    for insn in _md.disasm(blob, start):
+    for insn in _md.disasm(decode_blob, start):
         enc = insn.encoding  # capstone >= 5 byte offsets of disp/imm
         is_branch = bool(BRANCH_GROUPS & set(insn.groups))
         wild_here = False
@@ -166,7 +167,7 @@ def build_signature(img: Image, start: int, end: int, prefix: int) -> Signature 
         def mask_at(offset: int, size: int) -> None:
             nonlocal wild_here
             if size > 0:
-                _mask_bits(mask, offset, size)
+                _mask_bits(mask, insn.address - start + offset, size)
                 wild_here = True
 
         # branch/call displacements
@@ -183,7 +184,7 @@ def build_signature(img: Image, start: int, end: int, prefix: int) -> Signature 
                     mask_at(enc.disp_offset, enc.disp_size)
         wild += wild_here
         count += 1
-        if insn.address + insn.size - start >= prefix:
+        if insn.address + insn.size - start >= size:
             break
     if count == 0:
         return None
@@ -237,26 +238,27 @@ def search_all(sigs: list[Signature], img: Image,
                regions: list[tuple[int, int]]) -> list[list[Match]]:
     """Find every signature within `regions` of (raw_ptr, size) form.
 
-    Single pass over the file using a 4-byte anchor index built from the
-    signatures themselves; candidates are verified with the full pattern."""
-    anchors: dict[bytes, list[tuple[int, int]]] = {}
+    Search using concrete anchors of up to four bytes. Verify each candidate
+    against the full pattern, including patterns with no concrete bytes."""
+    anchors: dict[int, dict[bytes, list[tuple[int, int]]]] = {}
+    wildcard_only = []
     for idx, sig in enumerate(sigs):
         run = first_concrete_run(sig)
         if run:
-            anchors.setdefault(sig.pattern[run[0]:run[0] + run[1]], []).append(
-                (idx, run[0]))
+            offset, length = run
+            by_length = anchors.setdefault(length, {})
+            by_length.setdefault(sig.pattern[offset:offset + length], []).append((idx, offset))
+        else:
+            wildcard_only.append(idx)
 
     regexes: list = [None] * len(sigs)
     hits: list[list[Match]] = [[] for _ in sigs]
 
     for raw_ptr, size in regions:
         blob_end = min(raw_ptr + size, len(img.data))
-        pos = raw_ptr
-        limit = blob_end - 4
-        while pos < limit:
-            entries = anchors.get(img.data[pos:pos + 4])
-            if entries:
-                for idx, anchor_off in entries:
+        for length, by_length in anchors.items():
+            for pos in range(raw_ptr, blob_end - length + 1):
+                for idx, anchor_off in by_length.get(img.data[pos:pos + length], ()):
                     cand = pos - anchor_off
                     if cand < raw_ptr or cand + len(sigs[idx].pattern) > blob_end:
                         continue
@@ -264,9 +266,8 @@ def search_all(sigs: list[Signature], img: Image,
                         regexes[idx] = compile_regex(sigs[idx])
                     if regexes[idx].match(img.data, cand):
                         hits[idx].append(Match(cand))
-                pos += 1
-            else:
-                pos += 1
+        for idx in wildcard_only:
+            hits[idx].extend(Match(pos) for pos in range(raw_ptr, blob_end - len(sigs[idx].pattern) + 1))
     return hits
 
 
@@ -343,9 +344,9 @@ def main() -> int:
         foreign = 0
         foreign_total = 0
         for idx, sig in enumerate(sigs):
-            own = orig.rva_to_off(sig.sig_start)
+            own = orig.rva_to_off(sig.fn_start)
             extra = [h for h in orig_hits[idx]
-                     if not (own <= h.offset < own + len(sig.pattern))]
+                     if not (own <= h.offset < own + sig.fn_end - sig.fn_start)]
             if extra:
                 foreign += 1
                 foreign_total += len(extra)
@@ -395,7 +396,7 @@ def main() -> int:
     for vi, (name, _) in enumerate(variants):
         reloc_hit = {loc: 0 for loc in ("appended", "original-site", "elsewhere")}
         reloc_examples: list[str] = []
-        vi_sigs = vi_retain = 0
+        vi_sigs = vi_retain = relocated_hits = 0
         retain_hits = 0
         for idx, sig in enumerate(sigs):
             if variant_of[idx] != vi:
@@ -404,8 +405,10 @@ def main() -> int:
                 vi_sigs += 1
                 got = hits[idx]
                 if got:
+                    relocated_hits += 1
+                    for location in {classify(sig, hit) for hit in got}:
+                        reloc_hit[location] += 1
                     loc = classify(sig, got[0])
-                    reloc_hit[loc] += 1
                     if len(reloc_examples) < 5:
                         reloc_examples.append(
                             f"    fn {sig.fn_start:#x}..{sig.fn_end:#x} matched at "
@@ -418,8 +421,8 @@ def main() -> int:
         print(f"variant: {name}   ({vi_sigs + vi_retain} signatures, "
               f"{skipped[vi]} skipped as too short)")
         print(f"  relocated functions : {vi_sigs}")
-        print(f"    still detected    : {sum(reloc_hit.values())} "
-              f"({100 * sum(reloc_hit.values()) / max(1, vi_sigs):.2f}%)  "
+        print(f"    still detected    : {relocated_hits} "
+              f"({100 * relocated_hits / max(1, vi_sigs):.2f}%)  "
               f"[original-site {reloc_hit['original-site']} / "
               f"appended {reloc_hit['appended']} / "
               f"elsewhere {reloc_hit['elsewhere']}]")
@@ -428,7 +431,7 @@ def main() -> int:
         print(f"  retained functions  : {vi_retain}")
         print(f"    still detected    : {retain_hits} "
               f"({100 * retain_hits / max(1, vi_retain):.2f}%)")
-        total = sum(reloc_hit.values()) + retain_hits
+        total = relocated_hits + retain_hits
         print(f"  OVERALL detection   : {total}/{vi_sigs + vi_retain} "
               f"({100 * total / max(1, vi_sigs + vi_retain):.2f}%)")
     print("=" * width)
