@@ -10,21 +10,47 @@
 use anyhow::{bail, Result};
 use iced_x86::{Decoder, DecoderOptions};
 
-use crate::analysis::Analysis;
+use crate::analysis::{Analysis, Function};
 use crate::pe::PeLayout;
 
+#[derive(Clone, Copy)]
+pub(crate) struct Region {
+    pub start_rva: u32,
+    pub offset: usize,
+    pub len: usize,
+    instr_count: usize,
+}
+
+impl From<&Function> for Region {
+    fn from(f: &Function) -> Self {
+        Self {
+            start_rva: f.start_rva,
+            offset: f.off,
+            len: (f.end_rva - f.start_rva) as usize,
+            instr_count: f.instr_count,
+        }
+    }
+}
+
 pub fn verify(pe: &PeLayout, data: &[u8], analysis: &Analysis) -> Result<()> {
-    for func in &analysis.functions {
-        let len = (func.end_rva - func.start_rva) as usize;
+    verify_regions(pe, data, analysis.functions.iter().map(Region::from))
+}
+
+pub(crate) fn verify_regions(
+    pe: &PeLayout,
+    data: &[u8],
+    regions: impl IntoIterator<Item = Region>,
+) -> Result<()> {
+    for func in regions {
         let mut decoder = Decoder::with_ip(
             64,
-            &data[func.off..func.off + len],
+            &data[func.offset..func.offset + func.len],
             pe.va(func.start_rva),
             DecoderOptions::NONE,
         );
         let mut count = 0usize;
         let mut consumed = 0usize;
-        while consumed < len {
+        while consumed < func.len {
             let ins = decoder.decode();
             if ins.is_invalid() {
                 bail!(

@@ -383,9 +383,7 @@ fn import_tail(ins: &Instruction, pe: &PeLayout) -> bool {    ins.is_jmp_near_in
             .is_some_and(|r| pe.import_slots.contains(&r))
 }
 fn layout_interior(pe: &PeLayout, rva: u32) -> bool {
-    pe.runtime_functions
-        .iter()
-        .any(|f| f.start < rva && rva < f.end)
+    pe.runtime_function_containing(rva).is_some_and(|f| f.start < rva)
 }
 
 #[derive(Default)]
@@ -486,7 +484,7 @@ fn eligible(
     let Some(info) = pe.unwind_info(f.start_rva) else {
         return Err("missing runtime metadata");
     };
-    let Some(extent) = pe.runtime_functions.iter().find(|r| r.start == f.start_rva) else {
+    let Some(extent) = pe.runtime_function_at(f.start_rva) else {
         return Err("missing runtime metadata");
     };
     let mut chain = info;
@@ -603,22 +601,14 @@ fn eligible(
             } else if seen_dead {
                 return Err("interior dead code");
             }
-            let trimmable = ins.dead
-                && !pe.is_protected(ins.off..ins.off + ins.len)
-                && !pe
-                    .metadata_pinned
-                    .iter()
-                    .any(|r| r.start < ins.rva + ins.len as u32 && ins.rva < r.end);
-            // Chain primaries are pinned because secondaries reference their
-            // original extent. Layouts that retain original bodies keep every
-            // stale reference consistent, so the primary may move.
-            let meta_pinned_only = !pe.is_protected(ins.off..ins.off + ins.len)
-                && pe
-                    .metadata_pinned
-                    .iter()
-                    .any(|r| r.start < ins.rva + ins.len as u32 && ins.rva < r.end);
-            let allowed_pinned = trimmable || (meta_pinned_only && stale_ok);
-            if (ins.pinned && !allowed_pinned)
+            // A pinned instruction can move only when the original chain
+            // extent survives or a dead instruction will be trimmed.
+            let blocked = ins.pinned && {
+                let metadata = pe.is_metadata_pinned(ins.rva..ins.rva + ins.len as u32);
+                let allowed = if metadata { stale_ok } else { ins.dead };
+                !allowed || pe.is_protected(ins.off..ins.off + ins.len)
+            };
+            if blocked
                 || matches!(ins.iced.mnemonic(), Mnemonic::Endbr64 | Mnemonic::Endbr32)
             {
                 return Err("pinned or unreachable instructions");
@@ -653,7 +643,7 @@ fn eligible(
                     // their trampoline, and any relocated interior is reached
                     // through a retargetable near-form branch that the commit
                     // phase rewrites.
-                    let entry = pe.runtime_functions.iter().any(|f| f.start == target);
+                    let entry = pe.runtime_function_at(target).is_some();
                     let can_widen = stale_ok
                         && (target < f.start_rva || target >= f.end_rva)
                         && (ins.iced.is_jcc_short() || ins.iced.is_jmp_short());
@@ -917,7 +907,7 @@ pub(crate) fn run_with_alias_state(
             {
                 for ins in &mut tail.instrs {
                     ins.dead = false;
-                    ins.pinned = layout.metadata_pinned.iter().any(|r| r.contains(&ins.rva));
+                    ins.pinned = layout.is_metadata_pinned(ins.rva..ins.rva + 1);
                 }
             }
         }
@@ -1389,10 +1379,8 @@ pub(crate) fn run_with_alias_state(
         for (&old_target, sources) in &analysis.address_references {
             // Preserve function-pointer identity and existing CFG entry tables.
             // The stable entry trampoline already reaches the relocated body.
-            if kept_entries.iter().any(|range| range.contains(&old_target)) || layout
-                .runtime_functions
-                .iter()
-                .any(|f| f.start == old_target)
+            if kept_entries.iter().any(|range| range.contains(&old_target))
+                || layout.runtime_function_at(old_target).is_some()
             {
                 continue;
             }
@@ -1429,10 +1417,8 @@ pub(crate) fn run_with_alias_state(
         // same treatment: the displacement is rewritten to the new address in
         // both the original bytes and the relocated copy of the source.
         for (&old_target, sources) in &analysis.branch_sources {
-            if kept_entries.iter().any(|range| range.contains(&old_target)) || layout
-                .runtime_functions
-                .iter()
-                .any(|f| f.start == old_target)
+            if kept_entries.iter().any(|range| range.contains(&old_target))
+                || layout.runtime_function_at(old_target).is_some()
             {
                 continue;
             }
@@ -1441,12 +1427,9 @@ pub(crate) fn run_with_alias_state(
             };
             // Branches inside the relocated function itself are remapped by
             // the encoder; only foreign sources need patching here.
-            let owner_fn = analysis
-                .functions
-                .iter()
-                .position(|f| f.start_rva <= old_target && old_target < f.end_rva);
             for (owner, source) in sources {
-                if Some(*owner) == owner_fn {
+                let owner = &analysis.functions[*owner];
+                if (owner.start_rva..owner.end_rva).contains(&old_target) {
                     continue;
                 }
                 // Short-form or pinned foreign edges keep pointing at the
@@ -1472,7 +1455,7 @@ pub(crate) fn run_with_alias_state(
                             eprintln!(
                                 "  target rva {:#x} runtime-start? {} sources {:?}",
                                 old_target,
-                                layout.runtime_functions.iter().any(|f| f.start == old_target),
+                                layout.runtime_function_at(old_target).is_some(),
                                 analysis.branch_sources.get(&old_target).map(|s| s.len())
                             );
                         }

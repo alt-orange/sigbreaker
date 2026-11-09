@@ -51,7 +51,7 @@ pub struct Cli {
     /// Input x86-64 PE executable to diversify.
     pub input: PathBuf,
 
-    /// Output path (defaults to `<input>.sigbrk.exe`).
+    /// Output path (defaults to `<stem>.sigbrk.<extension>` beside the input).
     #[arg(short, long)]
     pub output: Option<PathBuf>,
     /// Linker /MAP file establishing statically linked CRT handler identities.

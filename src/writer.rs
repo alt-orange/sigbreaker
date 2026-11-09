@@ -314,9 +314,7 @@ impl SectionPlan {
             let start = text.virtual_address + (*off - text.raw_ptr as usize) as u32;
             let extent = pe
                 .layout()
-                .runtime_functions
-                .iter()
-                .find(|f| f.start == start)
+                .runtime_function_at(start)
                 .context("entry patch has no function extent")?;
             let end = *off + (extent.end - extent.start) as usize;
             if *off < text.raw_ptr as usize || end > insert || bytes.len() != 5 {

@@ -317,6 +317,22 @@ fn relocation_directory_survives_section_rename() {
 }
 
 #[test]
+fn unsorted_overlapping_relocations_protect_the_full_union() {
+    let mut fixture = TestPe::new();
+    // Two eight-byte fixups in descending order, four bytes apart.
+    fixture.data[0xC08..0xC0A].copy_from_slice(&0xA014u16.to_le_bytes());
+    fixture.data[0xC0A..0xC0C].copy_from_slice(&0xA010u16.to_le_bytes());
+    let pe = PeFile::parse(fixture.data).unwrap();
+    let layout = pe.layout();
+    assert_eq!(layout.relocation_count(), 2);
+    assert!(!layout.is_protected(0x80F..0x810));
+    assert!(layout.is_protected(0x810..0x811));
+    assert!(layout.is_protected(0x815..0x816));
+    assert!(layout.is_protected(0x81B..0x81C));
+    assert!(!layout.is_protected(0x81C..0x81D));
+}
+
+#[test]
 fn rejects_truncated_exception_directory_and_short_optional_header() {
     let mut fixture = metadata_fixture(&[0xC3]);
     fixture.data[0xE4..0xE8].copy_from_slice(&11u32.to_le_bytes());

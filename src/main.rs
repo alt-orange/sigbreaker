@@ -7,7 +7,7 @@ use sigbraker::{cli::Cli, pipeline};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match pipeline::run(&cli) {
+    match pipeline::run_with_progress(&cli, |stage| eprintln!("[sigbraker] {stage}")) {
         Ok(report) => {
             println!("{report}");
             ExitCode::SUCCESS

@@ -1,5 +1,6 @@
 //! Pipeline: parse → lift → diversify → verify → write.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -15,6 +16,11 @@ use crate::verify;
 
 /// Runs SigBreaker end-to-end and returns a human-readable report.
 pub fn run(cli: &Cli) -> Result<String> {
+    run_with_progress(cli, |_| {})
+}
+
+/// Runs SigBreaker and reports stages as they start.
+pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<String> {
     for (name, p) in [
         ("--seg-prob", cli.seg_prob),
         ("--reorder-prob", cli.reorder_prob),
@@ -27,6 +33,7 @@ pub fn run(cli: &Cli) -> Result<String> {
         }
     }
 
+    progress("Reading PE and unwind metadata");
     let raw = std::fs::read(&cli.input)
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
     let mut pe = PeFile::parse(raw)?;
@@ -41,6 +48,7 @@ pub fn run(cli: &Cli) -> Result<String> {
     let layout = pe.layout().clone();
 
     let mut rng = StdRng::seed_from_u64(cli.seed);
+    progress("Analyzing executable code and references");
     let analysis = Analysis::run(&layout, &pe.data)?;
 
     let total_instr: usize = analysis.functions.iter().map(|f| f.instr_count).sum();
@@ -84,12 +92,14 @@ pub fn run(cli: &Cli) -> Result<String> {
     // Count unique functions by their final code bytes, excluding header-only
     // changes, reverted edits, and duplicate transformations across passes.
     let original_data = pe.data.clone();
+    let original_regions: Vec<_> = analysis.functions.iter().map(verify::Region::from).collect();
 
     let mut pass = |name: &str, detail: String, c: crate::stats::Counters| {
         let _ = writeln!(report, "  [pass] {name}: {detail} ({c})");
     };
 
     // Pass 1 — segment selector injection.
+    progress("Applying in-place transformations");
     if !cli.no_seg_inject && !cli.segments.is_empty() {
         let segments: Vec<iced_x86::Register> = cli.segments.iter().map(|s| s.register()).collect();
         let cfg = segment_inject::Config {
@@ -118,17 +128,15 @@ pub fn run(cli: &Cli) -> Result<String> {
         );
     }
 
-    // Re-lift before shuffling: reordering moved instructions inside blocks,
-    // so every instruction offset and RIP-relative target in `analysis` is
-    // stale. Shuffling only moves whole chains and patches branches — but it
-    // must do so against the *current* bytes. The original analysis is kept
-    // for the verify pass, which checks the structural invariant "the transformed
-    // image still decodes to the original instruction count".
-    let lifted = Analysis::run(&layout, &pe.data)?;
+    // Keep the original verification spans, but release the instruction and
+    // reference graphs before lifting the modified bytes.
+    drop(analysis);
     // Pass 3 — opcode aliasing, in place. Runs after reordering so it is the
     // last writer of the in-place bytes.
     let alias_in_place = !cli.no_alias && cli.alias_prob > 0.0;
     if alias_in_place {
+        progress("Analyzing reordered code and aliasing opcodes");
+        let lifted = Analysis::run(&layout, &pe.data)?;
         let cfg = opcode_alias::Config {
             probability: cli.alias_prob,
         };
@@ -139,15 +147,16 @@ pub fn run(cli: &Cli) -> Result<String> {
             c,
         );
     }
-    // Re-lift again: relocation must see the aliased bytes so its byte-exact
-    // encoding path preserves them and prologue validation stays consistent.
-    let lifted = Analysis::run(&layout, &pe.data)?;
     if !cli.no_verify {
-        verify::verify(&layout, &pe.data, &analysis)?;
+        verify::verify_regions(&layout, &pe.data, original_regions.iter().copied())?;
     }
 
     // Pass 3 — basic block shuffling.
     if !cli.no_shuffle || grow_segments {
+        // Relocation must see the final in-place instruction encodings.
+        progress("Analyzing modified code for block relocation");
+        let lifted = Analysis::run(&layout, &pe.data)?;
+        progress("Relocating basic blocks");
         if !layout.runtime_functions.is_empty() {
             let segments = grow_segments.then(|| segment_inject::Config {
                 probability: cli.seg_prob,
@@ -190,7 +199,7 @@ pub fn run(cli: &Cli) -> Result<String> {
 
     if !cli.no_verify {
         if layout.runtime_functions.is_empty() {
-            verify::verify(&layout, &pe.data, &analysis)?;
+            verify::verify_regions(&layout, &pe.data, original_regions.iter().copied())?;
         }
         let _ = writeln!(
             report,
@@ -198,17 +207,16 @@ pub fn run(cli: &Cli) -> Result<String> {
         );
     }
 
-    let transformed = analysis
-        .functions
+    let transformed = original_regions
         .iter()
         .filter(|func| {
-            let range = func.off..func.off + (func.end_rva - func.start_rva) as usize;
+            let range = func.offset..func.offset + func.len;
             pe.layout()
                 .rva_to_offset(func.start_rva)
                 .is_some_and(|off| original_data[range.clone()] != pe.data[off..off + range.len()])
         })
         .count();
-    let total = analysis.functions.len();
+    let total = original_regions.len();
     let percentage = if total == 0 {
         0.0
     } else {
@@ -224,6 +232,7 @@ pub fn run(cli: &Cli) -> Result<String> {
         .output
         .clone()
         .unwrap_or_else(|| default_output(&cli.input));
+    progress("Writing output");
     crate::writer::write_atomic(&out_path, &pe.data)
         .with_context(|| format!("failed to write {}", out_path.display()))?;
     let _ = writeln!(report, "  output   : {}", out_path.display());
@@ -232,10 +241,31 @@ pub fn run(cli: &Cli) -> Result<String> {
 }
 
 fn default_output(input: &Path) -> PathBuf {
-    let stem = input
+    let mut name = input
         .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "output".into());
-    let name = format!("{stem}.sigbrk.exe");
+        .unwrap_or_else(|| OsStr::new("output"))
+        .to_os_string();
+    let extension = input
+        .extension()
+        .filter(|extension| !extension.is_empty())
+        .unwrap_or_else(|| OsStr::new("exe"));
+    name.push(".sigbrk.");
+    name.push(extension);
     input.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_output_preserves_the_input_extension() {
+        for (input, expected) in [
+            ("bin/client.dll", "bin/client.sigbrk.dll"),
+            ("bin/loader_ui.exe", "bin/loader_ui.sigbrk.exe"),
+            ("bin/module", "bin/module.sigbrk.exe"),
+        ] {
+            assert_eq!(default_output(Path::new(input)), Path::new(expected));
+        }
+    }
 }

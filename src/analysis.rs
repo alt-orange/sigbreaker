@@ -195,7 +195,7 @@ impl Analysis {
                         {
                             if pe.executable_sections().any(|s| s.contains_rva(rva)) {
                                 if ins.iced.mnemonic() == iced_x86::Mnemonic::Lea {
-                                    if pe.runtime_functions.iter().any(|f| f.start == rva) {
+                                    if pe.runtime_function_at(rva).is_some() {
                                         // A materialized function entry: the
                                         // entry keeps its trampoline, so the
                                         // value stays valid without rewriting.
@@ -208,7 +208,7 @@ impl Analysis {
                                 }
                                 call_targets.insert(rva);
                                 data_refs.insert(rva);
-                                if pe.runtime_functions.iter().any(|f| f.start == rva) {
+                                if pe.runtime_function_at(rva).is_some() {
                                     call_targets.insert(rva + 1);
                                     data_refs.insert(rva + 1);
                                 }
@@ -534,10 +534,7 @@ impl Analysis {
             let len = ins.len();
             let rva = sec.virtual_address + (cur - sec.raw_ptr as usize) as u32;
             let pinned = pe.is_protected(cur..cur + len)
-                || pe
-                    .metadata_pinned
-                    .iter()
-                    .any(|range| range.start < rva + len as u32 && rva < range.end);
+                || pe.is_metadata_pinned(rva..rva + len as u32);
             instrs.push(Instr {
                 off: cur,
                 rva: sec.virtual_address + (cur - sec.raw_ptr as usize) as u32,

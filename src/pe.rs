@@ -123,6 +123,18 @@ impl PeLayout {
     pub fn unwind_info(&self, function_start: u32) -> Option<&UnwindInfo> {
         self.unwind.get(&function_start)
     }
+
+    pub(crate) fn runtime_function_at(&self, start: u32) -> Option<&Range<u32>> {
+        self.runtime_functions
+            .binary_search_by_key(&start, |r| r.start)
+            .ok()
+            .map(|index| &self.runtime_functions[index])
+    }
+
+    pub(crate) fn runtime_function_containing(&self, rva: u32) -> Option<&Range<u32>> {
+        let index = self.runtime_functions.partition_point(|r| r.end <= rva);
+        self.runtime_functions.get(index).filter(|r| r.contains(&rva))
+    }
     /// Virtual address of an RVA.
     pub fn va(&self, rva: u32) -> u64 {
         self.image_base.wrapping_add(rva as u64)
@@ -152,9 +164,16 @@ impl PeLayout {
 
     /// Whether a byte range overlaps any base-relocation fixup.
     pub fn is_protected(&self, range: Range<usize>) -> bool {
-        self.protected
-            .iter()
-            .any(|p| p.start < range.end && range.start < p.end)
+        // All fixup ranges reserve eight bytes and are sorted by start, so
+        // their ends are sorted as well, including overlapping ranges.
+        let index = self.protected.partition_point(|p| p.end <= range.start);
+        self.protected.get(index).is_some_and(|p| p.start < range.end)
+    }
+
+    pub(crate) fn is_metadata_pinned(&self, range: Range<u32>) -> bool {
+        // Chain references have validated, nonoverlapping runtime extents.
+        let index = self.metadata_pinned.partition_point(|p| p.end <= range.start);
+        self.metadata_pinned.get(index).is_some_and(|p| p.start < range.end)
     }
 
     /// Number of relocation fixups discovered.
@@ -198,16 +217,38 @@ impl PeLayout {
         owned: &[Range<usize>],
     ) -> BTreeSet<u32> {
         let mut targets = BTreeSet::new();
+        // Merge all ranges excluded by candidate start once. Checking each
+        // word against every unwind and exception record is quadratic on
+        // images with large .rdata and runtime tables.
+        let mut ignored: Vec<_> = owned
+            .iter()
+            .chain(&self.unwind_bytes)
+            .chain(self.c_specific.values().map(|i| &i.table_bytes))
+            .chain(self.eh_continuation_table.iter())
+            .chain(self.cpp_eh.values().flat_map(|i| &i.owned))
+            .filter(|r| !r.is_empty())
+            .collect();
+        ignored.sort_unstable_by_key(|r| r.start);
+        let mut excluded: Vec<Range<usize>> = Vec::new();
+        for range in ignored {
+            if let Some(last) = excluded.last_mut().filter(|last| range.start <= last.end) {
+                last.end = last.end.max(range.end);
+            } else {
+                excluded.push(range.clone());
+            }
+        }
         for section in self
             .sections
             .iter()
             .filter(|s| !s.is_executable() && s.characteristics & 0x8000_0000 == 0)
         {
             let range = self.section_raw_range(section, data.len());
+            let mut index = excluded.partition_point(|r| r.end <= range.start);
             for at in (range.start..range.end).step_by(4) {
-                if owned.iter().any(|r| r.contains(&at))
-                    || self.unwind_bytes.iter().any(|r| r.contains(&at))
-                {
+                while excluded.get(index).is_some_and(|r| r.end <= at) {
+                    index += 1;
+                }
+                if excluded.get(index).is_some_and(|r| r.contains(&at)) {
                     continue;
                 }
                 // Runtime records describe function extents, and relocation
@@ -218,21 +259,6 @@ impl PeLayout {
                             r.start <= at && at + size <= r.end
                         })
                 };
-                if self
-                    .c_specific
-                    .values()
-                    .any(|info| info.table_bytes.contains(&at))
-                    || self
-                        .eh_continuation_table
-                        .as_ref()
-                        .is_some_and(|r| r.contains(&at))
-                    || self
-                        .cpp_eh
-                        .values()
-                        .any(|i| i.owned.iter().any(|r| r.contains(&at)))
-                {
-                    continue;
-                }
                 if let Some(bytes) = data.get(at..at + 4).filter(|_| scan(4)) {
                     let rva = u32::from_le_bytes(bytes.try_into().unwrap());
                     if self.executable_sections().any(|s| s.contains_rva(rva)) {
@@ -534,18 +560,19 @@ impl PeFile {
             }
             let mut unwind_rvas: Vec<u32> = records.iter().map(|r| r.2).collect();
             unwind_rvas.sort_unstable();
+            unwind_rvas.dedup();
             // Byte extent of every unwind record (header, codes, handler data)
             // so value scans can ignore non-pointer xdata content.
-            for (_, _, unwind_rva) in &records {
-                let Some(header) = layout.rva_to_offset(*unwind_rva) else {
+            for (index, &unwind_rva) in unwind_rvas.iter().enumerate() {
+                let Some(header) = layout.rva_to_offset(unwind_rva) else {
                     continue;
                 };
-                let end_off = match unwind_rvas.iter().find(|&&r| r > *unwind_rva) {
+                let end_off = match unwind_rvas.get(index + 1) {
                     Some(&next) => layout.rva_to_offset(next),
                     None => layout
                         .sections
                         .iter()
-                        .find(|s| s.contains_rva(*unwind_rva))
+                        .find(|s| s.contains_rva(unwind_rva))
                         .map(|s| (s.raw_ptr as usize + s.raw_size as usize).min(data.len())),
                 };
                 if let Some(end_off) = end_off.filter(|&end| end > header) {
@@ -610,8 +637,7 @@ impl PeFile {
                             .checked_add((slots_end + 4 - header) as u32)
                             .context("handler data overflow")?;
                         let blob_end = unwind_rvas
-                            .iter()
-                            .find(|&&r| r > unwind_rva)
+                            .get(unwind_rvas.partition_point(|&r| r <= unwind_rva))
                             .copied();
                         let identity = handler_symbols.get(&handler_rva).cloned().or_else(|| {
                             crate::exception::handler_name(&layout, &data, &imports, handler_rva)
@@ -737,7 +763,11 @@ impl PeFile {
                     if !seen.insert(current.rva) {
                         bail!("cyclic unwind chain");
                     }
-                    if !runtime_functions.contains(&(begin..end)) {
+                    if runtime_functions
+                        .binary_search_by_key(&begin, |r| r.start)
+                        .ok()
+                        .is_none_or(|index| runtime_functions[index].end != end)
+                    {
                         bail!("unresolved chained function extent");
                     }
                     current = unwind.get(&begin).context("unresolved unwind chain")?;
@@ -747,8 +777,11 @@ impl PeFile {
                 }
             }
         }
+        metadata_pinned.sort_unstable_by_key(|r| r.start);
+        metadata_pinned.dedup();
         let relocation_directory = directory(5)?;
-        let protected = collect_relocations(&data, &layout, relocation_directory.clone())?;
+        let mut protected = collect_relocations(&data, &layout, relocation_directory.clone())?;
+        protected.sort_unstable_by_key(|r| r.start);
         Ok(PeFile {
             data,
             layout: PeLayout {
