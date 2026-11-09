@@ -8,6 +8,7 @@ use clap::Parser;
 use common::{TestPe, SAMPLE_CODE};
 use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 use sigbraker::cli::Cli;
+use sigbraker::pe::PeFile;
 use sigbraker::pipeline;
 
 struct TempExe {
@@ -138,6 +139,119 @@ fn same_seed_same_output() {
     let o2 = std::fs::read(out_path(&exe.path)).unwrap();
     assert_eq!(o1, o2, "same seed must give identical output");
     assert_eq!(r1, r2);
+}
+
+fn global_fixture() -> TempExe {
+    let code = [
+        0xB8, 1, 0, 0, 0, // mov eax, 1
+        0x03, 0x05, 0x19, 0x30, 0, 0, // add eax, [game+0x4024]
+        0x03, 0x05, 0xEF, 0x0F, 0, 0, // add eax, [game+0x2000]
+        0x85, 0xC9, // test ecx, ecx
+        0x74, 0x03, // je 0x1018
+        0xFF, 0xC0, 0xC3, // inc eax; ret
+        0xC3, // ret
+    ];
+    let mut data = TestPe::new().with_code(&code).data;
+    data[0x46..0x48].copy_from_slice(&5u16.to_le_bytes());
+    data[0x90..0x94].copy_from_slice(&0x6000u32.to_le_bytes());
+    data[0xE0..0xE4].copy_from_slice(&0x2040u32.to_le_bytes());
+    data[0xE4..0xE8].copy_from_slice(&12u32.to_le_bytes());
+    data[0x840..0x844].copy_from_slice(&0x1000u32.to_le_bytes());
+    data[0x844..0x848].copy_from_slice(&(0x1000 + code.len() as u32).to_le_bytes());
+    data[0x848..0x84C].copy_from_slice(&0x2080u32.to_le_bytes());
+    data[0x880] = 1;
+
+    data.resize(0x1200, 0);
+    for (at, name, rva, raw, flags) in [
+        (0x1C0, b".data", 0x4000u32, 0xE00u32, 0xC000_0040u32),
+        (0x1E8, b".auxx", 0x5000u32, 0x1000u32, 0x6000_0020u32),
+    ] {
+        data[at..at + name.len()].copy_from_slice(name);
+        for (field, value) in [(8, 0x200), (12, rva), (16, 0x200), (20, raw), (36, flags)] {
+            data[at + field..at + field + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    data[0x210..0x238].fill(0xA5); // Force header expansion on append.
+    data[0x1000] = 0xC3;
+    data[0xE20..0xE28].copy_from_slice(&[3, 0, 0, 0, 7, 0, 0, 0]);
+    data[0xC08..0xC0A].copy_from_slice(&0xA010u16.to_le_bytes()); // DIR64 at RVA 0x2010
+    data[0x810..0x818].copy_from_slice(&0x140004024u64.to_le_bytes());
+    TempExe::write(&data)
+}
+
+#[test]
+fn global_slots_move_data_and_retarget_original_and_appended_code() {
+    let exe = global_fixture();
+    let map = TempExe::write(b"global 0x4020 8 8\nglobal 0x2000 16 16\nrip 0x1005\nrip 0x100b\n");
+    let path = map.path.to_str().unwrap();
+    let mut runs = Vec::new();
+    for slot in ["5", "17", "5"] {
+        let report = pipeline::run(&exe.cli(&[
+            "--global-map",
+            path,
+            "--global-slot",
+            slot,
+            "--no-seg-inject",
+            "--no-reorder",
+            "--no-alias",
+            "--junk-prob",
+            "0",
+        ]))
+        .unwrap();
+        let pe = PeFile::parse(std::fs::read(out_path(&exe.path)).unwrap()).unwrap();
+        let layout = pe.layout();
+        let section = |name| layout.sections.iter().find(|s| s.name() == name).unwrap();
+        assert_eq!(section(".text").virtual_address, 0x1000);
+        assert_eq!(section(".sbdata").characteristics, 0xC000_0040);
+        assert_eq!(section(".sbro").characteristics, 0x4000_0040);
+        let slot = slot.parse::<u32>().unwrap();
+        let writable = section(".sbdata").virtual_address + slot * 8;
+        let read_only = section(".sbro").virtual_address + slot * 16;
+        assert!(report.contains(&format!("RVA 0x4020 -> {writable:#x}")));
+        let bytes = |rva, size| {
+            let start = layout.rva_to_offset(rva).unwrap();
+            &pe.data[start..start + size]
+        };
+        assert_eq!(bytes(0x4020, 8), &[0; 8]);
+        assert_eq!(bytes(0x2000, 16), &[0; 16]);
+        assert_eq!(bytes(writable, 8), &[3, 0, 0, 0, 7, 0, 0, 0]);
+        assert_eq!(bytes(read_only, 16), b"SIGBREAKER-DATA!");
+        assert_eq!(bytes(0x2010, 8), &layout.va(writable + 4).to_le_bytes());
+        let rip_targets = |rva, size| {
+            Decoder::with_ip(64, bytes(rva, size), layout.va(rva), DecoderOptions::NONE)
+                .into_iter()
+                .filter(|ins| ins.is_ip_rel_memory_operand())
+                .map(|ins| ins.ip_rel_memory_address())
+                .collect::<Vec<_>>()
+        };
+        let expected = [layout.va(writable + 4), layout.va(read_only)];
+        assert_eq!(rip_targets(0x1005, 12), expected);
+        let appended = section(".sbrk").virtual_address;
+        let moved = layout
+            .runtime_functions
+            .iter()
+            .find(|f| f.start >= appended)
+            .unwrap();
+        assert_eq!(
+            rip_targets(moved.start, (moved.end - moved.start) as usize),
+            expected
+        );
+        runs.push((writable, read_only, pe.data));
+    }
+    assert_ne!(runs[0].0, runs[1].0);
+    assert_ne!(runs[0].1, runs[1].1);
+    assert_eq!(runs[0], runs[2]);
+}
+
+#[test]
+fn missing_global_reference_leaves_existing_output_intact() {
+    let exe = global_fixture();
+    let map = TempExe::write(b"global 0x4020 8 8\n");
+    let output = out_path(&exe.path);
+    std::fs::write(&output, b"previous output").unwrap();
+    let error = pipeline::run(&exe.cli(&["--global-map", map.path.to_str().unwrap()])).unwrap_err();
+    assert!(format!("{error:#}").contains("missing 'rip 0x1005'"));
+    assert_eq!(std::fs::read(output).unwrap(), b"previous output");
 }
 
 #[test]

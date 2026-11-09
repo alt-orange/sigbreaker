@@ -16,11 +16,16 @@ path = "src/lib.rs"
 name = "sigbraker"
 path = "src/main.rs"
 
+[features]
+default = ["tui"]
+tui = ["dep:ratatui"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 iced-x86 = { version = "1.22", features = ["decoder", "encoder", "instr_info"] }
 rand = "0.8"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "unstable-rendered-line-info"], optional = true }
 
 [profile.release]
 lto = true

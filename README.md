@@ -11,7 +11,14 @@ cargo build --locked --release
 target/release/sigbraker.exe app.exe -o app.div.exe --seed 42
 target/release/sigbraker.exe app.exe --info
 target/release/sigbraker.exe --help
+target/release/sigbraker.exe --tui
 ```
+
+In the TUI, enter or paste the input PE path. Use **Tab** or **↑/↓** to
+select a field, **Space** to flip a switch, **F2** to inspect, and **F5** to
+process. The report pane shows progress, results and errors. Use **PgUp/PgDn**
+to scroll it and **Esc** to quit. Leave optional fields blank to use the CLI
+defaults. Build with `--no-default-features` for a CLI-only binary.
 
 Static CRT handler identities can be supplied from the matching linker `/MAP`
 file. The map must describe the exact input image:
@@ -39,6 +46,7 @@ header-only edits, rejected attempts, and reverted transformations are excluded.
 | Indirect branches | Constant register targets and bounded read-only absolute-VA, RVA, and signed-relative jump tables |
 | Interior references | Verified unchanged code-address values materialized by RIP-relative LEA; function-entry pointer identity stays stable |
 | PE layout | Existing `.text` growth, or an appended section with header expansion and raw-offset movement |
+| Global data | Explicitly mapped initialized objects move to appended data sections with patched references |
 
 FH3 IP-to-state maps and FH4 compressed state maps follow emitted instruction
 spans, including synthetic fall-through edges. FH4 handler continuations and
@@ -100,11 +108,46 @@ is distinct from actually relocating its exception-handling functions.
 | `--no-shuffle` | off | Disable block shuffling |
 | `--wipe-original` | off | Scrub original bodies behind entry jumps when relocation appends a section. With junk enabled, eligible calls in retained bodies can jump to their relocated copies |
 | `--handler-map` | none | Matching linker map for static handlers |
+| `--global-map` | none | Map of initialized globals to move and their RIP-relative reference sites |
+| `--global-slot` | derived from seed | Layout slot from 0 to 255 for `--global-map` |
 | `--no-verify` | off | Disable the in-place decode check |
 
 FS/GS prefixes can change addresses; use them only in an environment where that
 change is intended. Structural checks do not establish arbitrary-binary runtime
 equivalence. Rewriting also invalidates existing image signatures.
+
+### Moving selected global structs
+
+Supply a map for the exact linked input image. All addresses in this map are
+RVAs (virtual addresses minus the image base), with decimal or `0x` notation.
+
+```text
+# global RVA SIZE ALIGNMENT (sizes and alignment are in bytes)
+global 0x5020 24 8
+# Each RIP-relative instruction that accesses the object or one of its fields
+rip 0x1130
+rip 0x126a
+```
+
+```powershell
+target/release/sigbraker.exe game.exe --global-map globals.txt --global-slot 5 -o game.build5.exe
+target/release/sigbraker.exe game.exe --global-map globals.txt --global-slot 6 -o game.build6.exe
+```
+
+For a fixed input and map, distinct explicit slots give the selected objects
+distinct module-relative addresses. Each run reports the old and new RVAs.
+The pass preserves field offsets and read/write permissions, retargets listed
+RIP-relative instructions and incoming `DIR64` pointers, and zeroes the old
+storage. The data move works with code passes disabled and with appended code.
+
+Use this with ordinary, file-backed initialized objects in `.data` and
+`.rdata`. Supply every RIP-relative reference, including references from leaf
+functions outside the unwind table. A linker symbol map can help identify an
+object's RVA. Its size, alignment and reference sites must come from the matching
+build's symbols, code and data. Exported globals, embedded base relocations,
+unlisted RVA tables, references to one-past-end addresses, and addresses
+computed from a different object or section base are outside this pass's
+contract. The pass rejects invalid entries and missing references it detects.
 
 ## Validation
 

@@ -408,38 +408,7 @@ impl PeFile {
             pointer_scan_exclusions: Vec::new(),
             unwind: BTreeMap::new(),
         };
-        let directory = |index: usize| -> Result<Option<Range<usize>>> {
-            let count = u32_le(&data, opt + 108)? as usize;
-            if index >= count {
-                return Ok(None);
-            }
-            let at = 112 + index * 8;
-            if at + 8 > optional_size {
-                bail!("truncated data directory");
-            }
-            let rva = u32_le(&data, opt + at)?;
-            let size = u32_le(&data, opt + at + 4)?;
-            if rva == 0 && size == 0 {
-                return Ok(None);
-            }
-            if rva == 0 || size == 0 {
-                bail!("incomplete data directory");
-            }
-            let last = rva
-                .checked_add(size - 1)
-                .context("data directory overflow")?;
-            let start = layout
-                .rva_to_offset(rva)
-                .context("unmapped data directory")?;
-            let end = layout
-                .rva_to_offset(last)
-                .context("unmapped data directory end")?
-                + 1;
-            if end > data.len() || end.checked_sub(start) != Some(size as usize) {
-                bail!("data directory is not contiguous and file-backed");
-            }
-            Ok(Some(start..end))
-        };
+        let directory = |index| data_directory(&data, &layout, opt, optional_size, index);
         let mut runtime_functions = Vec::new();
         let mut unwind = BTreeMap::new();
         let mut metadata_pinned = Vec::new();
@@ -811,6 +780,20 @@ impl PeFile {
         &self.layout
     }
 
+    /// File-backed RVA directories. The certificate table uses raw offsets.
+    pub(crate) fn directory(&self, index: usize) -> Result<Option<Range<usize>>> {
+        let opt = self.layout.checksum_off - 64;
+        let size = u16_le(&self.data, opt - 4)? as usize;
+        data_directory(&self.data, &self.layout, opt, size, index)
+    }
+
+    pub(crate) fn visit_base_relocations(
+        &self,
+        visit: impl FnMut(u16, u32) -> Result<()>,
+    ) -> Result<()> {
+        visit_relocations(&self.data, self.directory(5)?, visit)
+    }
+
     /// Recomputes and stores the PE optional-header checksum.
     pub fn update_checksum(&mut self) {
         let off = self.layout.checksum_off;
@@ -954,6 +937,38 @@ fn structural_identity(
     StructuralIdentity::Unknown
 }
 
+fn data_directory(
+    data: &[u8],
+    layout: &PeLayout,
+    opt: usize,
+    optional_size: usize,
+    index: usize,
+) -> Result<Option<Range<usize>>> {
+    let count = u32_le(data, opt + 108)? as usize;
+    if index >= count {
+        return Ok(None);
+    }
+    let at = 112 + index * 8;
+    if at + 8 > optional_size {
+        bail!("truncated data directory");
+    }
+    let rva = u32_le(data, opt + at)?;
+    let size = u32_le(data, opt + at + 4)?;
+    if rva == 0 && size == 0 {
+        return Ok(None);
+    }
+    if rva == 0 || size == 0 {
+        bail!("incomplete data directory");
+    }
+    let last = rva.checked_add(size - 1).context("data directory overflow")?;
+    let start = layout.rva_to_offset(rva).context("unmapped data directory")?;
+    let end = layout.rva_to_offset(last).context("unmapped data directory end")? + 1;
+    if end > data.len() || end.checked_sub(start) != Some(size as usize) {
+        bail!("data directory is not contiguous and file-backed");
+    }
+    Ok(Some(start..end))
+}
+
 /// Walks the `.reloc` section and records the file offset of every fixup.
 ///
 /// Anything a relocation points at must stay byte-for-byte in place: the
@@ -965,8 +980,23 @@ fn collect_relocations(
     directory: Option<Range<usize>>,
 ) -> Result<Vec<Range<usize>>> {
     let mut out = Vec::new();
+    visit_relocations(data, directory, |_, rva| {
+        if let Some(target) = layout.rva_to_offset(rva) {
+            // Fixups are 4 or 8 bytes wide; reserve 8 conservatively.
+            out.push(target..target + 8);
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+fn visit_relocations(
+    data: &[u8],
+    directory: Option<Range<usize>>,
+    mut visit: impl FnMut(u16, u32) -> Result<()>,
+) -> Result<()> {
     let Some(directory) = directory else {
-        return Ok(out);
+        return Ok(());
     };
     let start = directory.start;
     let end = directory.end;
@@ -984,15 +1014,12 @@ fn collect_relocations(
                 continue; // IMAGE_REL_BASED_ABSOLUTE: padding
             }
             let rva = page_rva.wrapping_add((e & 0xFFF) as u32);
-            if let Some(target) = layout.rva_to_offset(rva) {
-                // Fixups are 4 or 8 bytes wide; reserve 8 conservatively.
-                out.push(target..target + 8);
-            }
+            visit(e >> 12, rva)?;
         }
         off += block_size as usize;
     }
     if off != end {
         bail!("truncated relocation block");
     }
-    Ok(out)
+    Ok(())
 }

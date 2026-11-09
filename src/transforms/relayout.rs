@@ -794,9 +794,10 @@ pub fn run_with_segments(
     segments: Option<&super::segment_inject::Config>,
     options: Options,
 ) -> Result<Counters> {
-    run_with_alias_state(analysis, pe, probability, rng, segments, options, false)
+    run_with_alias_state(analysis, pe, probability, rng, segments, options, false, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_alias_state(
     analysis: &Analysis,
     pe: &mut PeFile,
@@ -805,6 +806,7 @@ pub(crate) fn run_with_alias_state(
     segments: Option<&super::segment_inject::Config>,
     options: Options,
     aliased_in_place: bool,
+    force_append: bool,
 ) -> Result<Counters> {
     let mut c = Counters::default();
     if (probability == 0.0 && segments.is_none()) || pe.layout().runtime_functions.is_empty() {
@@ -814,10 +816,11 @@ pub(crate) fn run_with_alias_state(
     }
     let plan = SectionPlan::new_with_address_rewrites(
         pe,
-        analysis
-            .address_references
-            .keys()
-            .any(|r| layout_interior(pe.layout(), *r))
+        force_append
+            || analysis
+                .address_references
+                .keys()
+                .any(|r| layout_interior(pe.layout(), *r))
             || analysis.functions.iter().any(|f| !f.jump_tables.is_empty()),
     )?;
     let layout = pe.layout();

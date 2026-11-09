@@ -29,6 +29,7 @@ pub mod cli;
 pub mod cpp_eh;
 pub mod dependencies;
 pub mod exception;
+mod globals;
 pub mod indirect;
 pub mod pe;
 pub mod pipeline;

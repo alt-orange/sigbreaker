@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 
 use crate::analysis::Analysis;
 use crate::cli::Cli;
@@ -81,6 +81,40 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
         );
         return Ok(report);
     }
+    // Count unique functions by their final code bytes, excluding header-only
+    // changes, reverted edits, and duplicate transformations across passes.
+    let original_data = pe.data.clone();
+    let original_regions: Vec<_> = analysis
+        .functions
+        .iter()
+        .map(verify::Region::from)
+        .collect();
+    let (layout, analysis, shifted_regions) = if let Some(path) = &cli.global_map {
+        progress("Relocating selected globals");
+        let map = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let slot = cli
+            .global_slot
+            .unwrap_or_else(|| StdRng::seed_from_u64(cli.seed ^ 0x474C_4F42_414C).gen());
+        let moved = crate::globals::relocate(&mut pe, &analysis, &map, slot)
+            .with_context(|| format!("failed to apply global map {}", path.display()))?;
+        let _ = writeln!(report, "  globals  : {} moved (slot {slot})", moved.len());
+        for (old, new) in moved {
+            let _ = writeln!(report, "    RVA {old:#x} -> {new:#x}");
+        }
+        drop(analysis);
+        let layout = pe.layout().clone();
+        let analysis = Analysis::run(&layout, &pe.data)?;
+        let regions: Vec<_> = analysis
+            .functions
+            .iter()
+            .map(verify::Region::from)
+            .collect();
+        (layout, analysis, Some(regions))
+    } else {
+        (layout, analysis, None)
+    };
+    let verification_regions = shifted_regions.as_deref().unwrap_or(&original_regions);
     // Growing prefixes are automatic where supported. Disabling injection also
     // disables growth; metadata-free inputs retain their in-place fallback.
     let grow_segments = cli.grow_segments
@@ -89,10 +123,6 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
         && !cli.segments.is_empty()
         && cli.seg_prob > 0.0
         && !layout.runtime_functions.is_empty();
-    // Count unique functions by their final code bytes, excluding header-only
-    // changes, reverted edits, and duplicate transformations across passes.
-    let original_data = pe.data.clone();
-    let original_regions: Vec<_> = analysis.functions.iter().map(verify::Region::from).collect();
 
     let mut pass = |name: &str, detail: String, c: crate::stats::Counters| {
         let _ = writeln!(report, "  [pass] {name}: {detail} ({c})");
@@ -148,7 +178,7 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
         );
     }
     if !cli.no_verify {
-        verify::verify_regions(&layout, &pe.data, original_regions.iter().copied())?;
+        verify::verify_regions(&layout, &pe.data, verification_regions.iter().copied())?;
     }
 
     // Pass 3 — basic block shuffling.
@@ -178,6 +208,7 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
                     alias_probability: if cli.no_alias { 0.0 } else { cli.alias_prob },
                 },
                 alias_in_place,
+                cli.global_map.is_some(),
             )?;
             pass(
                 "basic block relocation",
@@ -199,7 +230,7 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
 
     if !cli.no_verify {
         if layout.runtime_functions.is_empty() {
-            verify::verify_regions(&layout, &pe.data, original_regions.iter().copied())?;
+            verify::verify_regions(&layout, &pe.data, verification_regions.iter().copied())?;
         }
         let _ = writeln!(
             report,

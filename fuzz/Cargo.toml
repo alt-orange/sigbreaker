@@ -8,7 +8,7 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-sigbraker = { path = ".." }
+sigbraker = { path = "..", default-features = false }
 rand = "0.8"
 
 [profile.release]

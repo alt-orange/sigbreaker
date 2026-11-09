@@ -42,7 +42,8 @@ with transformations intended to preserve behavior:\n\
   - DAG-based instruction reordering inside basic blocks\n\
   - basic block shuffling with explicit control-flow patching\n\n\
 Supported functions grow in .text or an appended section. Existing data RVAs \
-are preserved when opaque metadata prevents rebasing. Named FH3/FH4 and SEH \
+are preserved on the append path, apart from globals selected with --global-map. \
+Named FH3/FH4 and SEH \
 handlers, explicit static-handler maps, bounded indirect targets, and guarded \
 continuations are supported. Unknown formats stay pinned. Structural verification is not a proof of \
 behavioral equivalence."
@@ -57,6 +58,14 @@ pub struct Cli {
     /// Linker /MAP file establishing statically linked CRT handler identities.
     #[arg(long)]
     pub handler_map: Option<PathBuf>,
+
+    /// Map of initialized globals and their RIP-relative references in the input PE.
+    #[arg(long, conflicts_with = "info")]
+    pub global_map: Option<PathBuf>,
+
+    /// Global layout slot (0–255). Defaults to a slot derived from --seed.
+    #[arg(long, requires = "global_map")]
+    pub global_slot: Option<u8>,
 
     /// Deterministic RNG seed (same seed + same binary = same output).
     #[arg(long, default_value_t = 0x5349_4752)]
