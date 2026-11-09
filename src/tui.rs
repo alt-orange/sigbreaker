@@ -237,6 +237,7 @@ impl App {
                 Field::text("Global map", "--global-map", "Optional"),
                 Field::text("Global slot", "--global-slot", "Derived from seed"),
                 Field::text("Handler map", "--handler-map", "Optional"),
+                Field::toggle("Auto globals", "--auto-globals", false),
                 Field::toggle("Segment injection", "--no-seg-inject", true),
                 Field::toggle("Grow segments", "--no-grow-segments", true),
                 Field::toggle("Opcode aliasing", "--no-alias", true),

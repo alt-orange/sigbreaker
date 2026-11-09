@@ -9,6 +9,8 @@ use crate::analysis::Analysis;
 use crate::pe::{PeFile, SectionHeader};
 use crate::writer::{align, append_section, next_section_rva};
 
+mod automatic;
+
 const READ_ONLY_DATA: u32 = 0x4000_0040;
 const WRITABLE_DATA: u32 = 0xC000_0040;
 
@@ -294,15 +296,19 @@ fn read_rip_sites(
     Ok(decoded)
 }
 
-/// A map supplies the complete reference list for its input build. Decoded
-/// references and loader fixups provide independent checks where available.
+/// An explicit map supplies object boundaries and reference sites. Automatic
+/// mode uses the whole writable data section as the unit of relocation.
 pub(crate) fn relocate(
     pe: &mut PeFile,
     analysis: &Analysis,
-    map: &str,
+    map: Option<&str>,
     slot: u8,
 ) -> Result<Vec<(u32, u32)>> {
-    let (mut globals, rip_sites) = parse_map(pe, map)?;
+    let fixups = base_fixups(pe)?;
+    let (mut globals, rip_sites) = match map {
+        Some(map) => parse_map(pe, map)?,
+        None => automatic::discover(pe, &fixups)?,
+    };
     let metadata = metadata_ranges(pe, analysis, &globals)?;
     let rip_sites = read_rip_sites(pe, analysis, &globals, rip_sites, &metadata)?;
 
@@ -319,18 +325,30 @@ pub(crate) fn relocate(
         };
         let section_rva = next_section_rva(current)?;
         let mut payload = vec![0; (u32::from(slot) * alignment) as usize];
+        let mut zero_fill = 0;
         for g in globals
             .iter_mut()
             .filter(|g| g.characteristics == characteristics)
         {
-            let offset = align(u32::try_from(payload.len())?, g.alignment)?;
+            let next = u32::try_from(payload.len())?
+                .checked_add(zero_fill)
+                .context("global payload overflow")?;
+            let offset = align(next, g.alignment)?;
             g.destination = section_rva
                 .checked_add(offset)
                 .context("global destination overflow")?;
             payload.resize(offset as usize, 0);
             payload.extend_from_slice(&pe.data[g.bytes.clone()]);
+            zero_fill = g.rvas.end - g.rvas.start - u32::try_from(g.bytes.len())?;
         }
-        let (data, _) = append_section(current, section_rva, name, characteristics, &payload)?;
+        let (data, _) = append_section(
+            current,
+            section_rva,
+            name,
+            characteristics,
+            &payload,
+            zero_fill,
+        )?;
         output = Some(PeFile::parse_with_symbols(
             data,
             pe.layout().handler_symbols.clone(),
@@ -359,7 +377,44 @@ pub(crate) fn relocate(
         g.referenced = true;
     }
 
-    let mut fixups = BTreeSet::new();
+    for (&rva, &value) in &fixups {
+        let Some(old) = image_rva(pe, value) else {
+            continue;
+        };
+        let Some(i) = global_at(&globals, old) else {
+            continue;
+        };
+        let bytes = file_range(pe, rva, 8)?;
+        ensure!(
+            !metadata.iter().any(|r| overlaps(r, &bytes)),
+            "PE metadata at {rva:#x} references a selected global"
+        );
+        let destination =
+            global_at(&globals, rva).map_or(rva, |object| moved_target(&globals[object], rva));
+        let g = &mut globals[i];
+        let new = pe.layout().va(moved_target(g, old));
+        let bytes = file_range(&output, destination, 8)?;
+        output.data[bytes].copy_from_slice(&new.to_le_bytes());
+        g.referenced = true;
+    }
+    if map.is_none() {
+        automatic::retarget_metadata(&mut output, &globals[0])?;
+    }
+
+    let mut moved = Vec::with_capacity(globals.len());
+    for g in globals {
+        let old = g.rvas.start;
+        ensure!(g.referenced, "global {old:#x} has no verified references");
+        let bytes = file_range(&output, old, u32::try_from(g.bytes.len())?)?;
+        output.data[bytes].fill(0);
+        moved.push((old, g.destination));
+    }
+    *pe = PeFile::parse_with_symbols(output.data, pe.layout().handler_symbols.clone())?;
+    Ok(moved)
+}
+
+fn base_fixups(pe: &PeFile) -> Result<BTreeMap<u32, u64>> {
+    let mut fixups = BTreeMap::new();
     pe.visit_base_relocations(|kind, rva| {
         ensure!(
             kind == 10,
@@ -373,34 +428,8 @@ pub(crate) fn relocate(
                 .is_none(),
             "overlapping base relocation at {rva:#x}"
         );
-        fixups.insert(rva);
-        let value = u64::from_le_bytes(pe.data[bytes.clone()].try_into().unwrap());
-        let Some(old) = image_rva(pe, value) else {
-            return Ok(());
-        };
-        let Some(i) = global_at(&globals, old) else {
-            return Ok(());
-        };
-        ensure!(
-            !metadata.iter().any(|r| overlaps(r, &bytes)),
-            "PE metadata at {rva:#x} references a selected global"
-        );
-        let g = &mut globals[i];
-        let new = pe.layout().va(moved_target(g, old));
-        let bytes = file_range(&output, rva, 8)?;
-        output.data[bytes].copy_from_slice(&new.to_le_bytes());
-        g.referenced = true;
+        fixups.insert(rva, u64::from_le_bytes(pe.data[bytes].try_into()?));
         Ok(())
     })?;
-
-    let mut moved = Vec::with_capacity(globals.len());
-    for g in globals {
-        let old = g.rvas.start;
-        ensure!(g.referenced, "global {old:#x} has no verified references");
-        let bytes = file_range(&output, old, g.rvas.end - old)?;
-        output.data[bytes].fill(0);
-        moved.push((old, g.destination));
-    }
-    *pe = PeFile::parse_with_symbols(output.data, pe.layout().handler_symbols.clone())?;
-    Ok(moved)
+    Ok(fixups)
 }

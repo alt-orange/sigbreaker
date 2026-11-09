@@ -255,6 +255,89 @@ fn missing_global_reference_leaves_existing_output_intact() {
 }
 
 #[test]
+fn automatic_data_move_finds_leaf_references_and_moves_loader_fixups() {
+    let original = global_fixture();
+    let mut data = std::fs::read(&original.path).unwrap();
+    // A leaf in the second executable section has no runtime-function entry.
+    data[0x1C8..0x1CC].copy_from_slice(&0x280u32.to_le_bytes()); // .data virtual tail
+    data[0x1000..0x100D].copy_from_slice(&[
+        0x8B, 0x05, 0x1E, 0xF0, 0xFF, 0xFF, // mov eax, [RVA 0x4024]
+        0x03, 0x05, 0x54, 0xF2, 0xFF, 0xFF, // add eax, [RVA 0x4260]
+        0xC3,
+    ]);
+    data[0xF4..0xF8].copy_from_slice(&24u32.to_le_bytes());
+    data[0xC0C..0xC10].copy_from_slice(&0x4000u32.to_le_bytes());
+    data[0xC10..0xC14].copy_from_slice(&12u32.to_le_bytes());
+    data[0xC14..0xC18].copy_from_slice(&[0x30, 0xA0, 0x38, 0xA0]);
+    data[0xE30..0xE38].copy_from_slice(&0x140004024u64.to_le_bytes());
+    data[0xE38..0xE40].copy_from_slice(&0x140005000u64.to_le_bytes());
+    let exe = TempExe::write(&data);
+    let output = out_path(&exe.path);
+    for (slot, destination) in [("0", 0x6000), ("1", 0x7000)] {
+        let report = pipeline::run(&exe.cli(&[
+            "--auto-globals",
+            "--global-slot",
+            slot,
+            "--no-seg-inject",
+            "--no-reorder",
+            "--no-alias",
+            "--junk-prob",
+            "0",
+        ]))
+        .unwrap();
+        assert!(report.contains(&format!("RVA 0x4000 -> {destination:#x}")));
+        let pe = PeFile::parse(std::fs::read(&output).unwrap()).unwrap();
+        let layout = pe.layout();
+        let bytes = |rva, size| {
+            let offset = layout.rva_to_offset(rva).unwrap();
+            &pe.data[offset..offset + size]
+        };
+        assert_eq!(bytes(0x4000, 0x200), &[0; 0x200]);
+        assert_eq!(bytes(destination + 0x20, 8), &data[0xE20..0xE28]);
+        let mut leaf = Decoder::with_ip(
+            64,
+            bytes(0x5000, 13),
+            layout.va(0x5000),
+            DecoderOptions::NONE,
+        );
+        assert_eq!(
+            leaf.decode().ip_rel_memory_address(),
+            layout.va(destination + 0x24)
+        );
+        assert_eq!(
+            leaf.decode().ip_rel_memory_address(),
+            layout.va(destination + 0x260)
+        );
+        assert!(layout
+            .sections
+            .iter()
+            .any(|s| s.name() == ".sbdata" && s.contains_rva(destination + 0x260)));
+        assert!(layout.rva_to_offset(destination + 0x260).is_none());
+        for site in [0x2010, destination + 0x30] {
+            assert_eq!(bytes(site, 8), &layout.va(destination + 0x24).to_le_bytes());
+        }
+        assert_eq!(
+            bytes(destination + 0x38, 8),
+            &layout.va(0x5000).to_le_bytes()
+        );
+        assert_eq!(bytes(0x300C, 4), &destination.to_le_bytes());
+        let old = layout.rva_to_offset(0x4030).unwrap();
+        let new = layout.rva_to_offset(destination + 0x30).unwrap();
+        assert!(!layout.is_protected(old..old + 8));
+        assert!(layout.is_protected(new..new + 8));
+        assert!(layout.sections.iter().any(|s| s.name() == ".sbrk"));
+    }
+
+    // A possible RVA in ordinary data is ambiguous and must never be guessed.
+    data[0x820..0x824].copy_from_slice(&0x4024u32.to_le_bytes());
+    std::fs::write(&exe.path, &data).unwrap();
+    let before = std::fs::read(&output).unwrap();
+    let err = pipeline::run(&exe.cli(&["--auto-globals"])).unwrap_err();
+    assert!(format!("{err:#}").contains("possible untyped .data reference"));
+    assert_eq!(std::fs::read(output).unwrap(), before);
+}
+
+#[test]
 fn report_counts_changed_functions_and_excludes_checksum_only_edits() {
     let mut code = vec![0x90; 16];
     code[..6].copy_from_slice(&[0xE8, 11, 0, 0, 0, 0xC3]);

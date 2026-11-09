@@ -42,7 +42,7 @@ with transformations intended to preserve behavior:\n\
   - DAG-based instruction reordering inside basic blocks\n\
   - basic block shuffling with explicit control-flow patching\n\n\
 Supported functions grow in .text or an appended section. Existing data RVAs \
-are preserved on the append path, apart from globals selected with --global-map. \
+are preserved on the append path, apart from data moved by the global options. \
 Named FH3/FH4 and SEH \
 handlers, explicit static-handler maps, bounded indirect targets, and guarded \
 continuations are supported. Unknown formats stay pinned. Structural verification is not a proof of \
@@ -60,11 +60,15 @@ pub struct Cli {
     pub handler_map: Option<PathBuf>,
 
     /// Map of initialized globals and their RIP-relative references in the input PE.
-    #[arg(long, conflicts_with = "info")]
+    #[arg(long, group = "global_layout", conflicts_with = "info")]
     pub global_map: Option<PathBuf>,
 
+    /// Move a supported image's writable .data section using only the input PE.
+    #[arg(long, group = "global_layout", conflicts_with = "info")]
+    pub auto_globals: bool,
+
     /// Global layout slot (0–255). Defaults to a slot derived from --seed.
-    #[arg(long, requires = "global_map")]
+    #[arg(long, requires = "global_layout")]
     pub global_slot: Option<u8>,
 
     /// Deterministic RNG seed (same seed + same binary = same output).

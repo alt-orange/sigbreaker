@@ -389,7 +389,7 @@ impl SectionPlan {
                 code.extend_from_slice(&value.to_le_bytes());
             }
         }
-        let (mut output, shift) = append_section(pe, self.rva, ".sbrk", 0x6000_0020, &code)?;
+        let (mut output, shift) = append_section(pe, self.rva, ".sbrk", 0x6000_0020, &code, 0)?;
         put(
             &mut output,
             self.opt + 112 + 3 * 8,
@@ -447,13 +447,14 @@ impl RawShift {
     }
 }
 
-/// Append file-backed bytes while preserving all existing section RVAs.
+/// Append initialized bytes and an optional zero-filled virtual tail.
 pub(crate) fn append_section(
     pe: &PeFile,
     rva: u32,
     prefix: &str,
     characteristics: u32,
     payload: &[u8],
+    zero_fill: u32,
 ) -> Result<(Vec<u8>, RawShift)> {
     let opt = u32_at(&pe.data, 0x3C)? as usize + 24;
     let count = pe.layout().sections.len();
@@ -523,8 +524,11 @@ pub(crate) fn append_section(
         )?,
         file_align,
     )? as usize;
-    let virtual_size = u32::try_from(payload.len())?;
-    let raw_size = align(virtual_size, file_align)? as usize;
+    let initialized_size = u32::try_from(payload.len())?;
+    let virtual_size = initialized_size
+        .checked_add(zero_fill)
+        .context("appended virtual size overflow")?;
+    let raw_size = align(initialized_size, file_align)? as usize;
     let insertion_size = raw
         .checked_sub(insert + header_growth)
         .context("append alignment underflow")?
@@ -613,7 +617,7 @@ pub(crate) fn append_section(
         &mut output,
         opt + 56,
         align(
-            rva.checked_add(virtual_size)
+            rva.checked_add(virtual_size.max(u32::try_from(raw_size)?))
                 .context("image size overflow")?,
             section_align,
         )?,

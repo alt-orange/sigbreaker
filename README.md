@@ -109,7 +109,8 @@ is distinct from actually relocating its exception-handling functions.
 | `--wipe-original` | off | Scrub original bodies behind entry jumps when relocation appends a section. With junk enabled, eligible calls in retained bodies can jump to their relocated copies |
 | `--handler-map` | none | Matching linker map for static handlers |
 | `--global-map` | none | Map of initialized globals to move and their RIP-relative reference sites |
-| `--global-slot` | derived from seed | Layout slot from 0 to 255 for `--global-map` |
+| `--auto-globals` | off | Move the writable `.data` section using only the input PE |
+| `--global-slot` | derived from seed | Layout slot from 0 to 255 for either global relocation mode |
 | `--no-verify` | off | Disable the in-place decode check |
 
 FS/GS prefixes can change addresses; use them only in an environment where that
@@ -118,6 +119,25 @@ equivalence. Rewriting also invalidates existing image signatures.
 
 ### Moving selected global structs
 
+For binary-only processing, use **Auto globals** in the TUI or run:
+
+```powershell
+target/release/sigbraker.exe game.exe --auto-globals --global-slot 5 -o game.build5.exe
+```
+
+This moves a supported PE's entire writable `.data` section to appended
+storage, including its zero-filled tail. It preserves offsets within the
+section and updates decoded RIP-relative references and `DIR64` fixups.
+Choose distinct slots to get distinct RVAs from the same input. The report
+shows the old and new section RVAs.
+
+Automatic mode requires page-aligned sections and conventional code and
+metadata. It rejects images with unresolved indirect control flow, opaque
+unwind metadata, or values that might be untyped references into `.data`.
+It cannot infer arbitrary addresses computed at runtime. A rejected run leaves
+the destination intact.
+
+For individual objects, including ones in `.rdata`, use `--global-map`.
 Supply a map for the exact linked input image. All addresses in this map are
 RVAs (virtual addresses minus the image base), with decimal or `0x` notation.
 

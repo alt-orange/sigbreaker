@@ -89,16 +89,37 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
         .iter()
         .map(verify::Region::from)
         .collect();
-    let (layout, analysis, shifted_regions) = if let Some(path) = &cli.global_map {
-        progress("Relocating selected globals");
-        let map = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+    let move_globals = cli.auto_globals || cli.global_map.is_some();
+    let (layout, analysis, shifted_regions) = if move_globals {
+        progress(if cli.auto_globals {
+            "Discovering and relocating .data references"
+        } else {
+            "Relocating selected globals"
+        });
+        let map = cli
+            .global_map
+            .as_ref()
+            .map(|path| {
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("failed to read {}", path.display()))
+            })
+            .transpose()?;
         let slot = cli
             .global_slot
             .unwrap_or_else(|| StdRng::seed_from_u64(cli.seed ^ 0x474C_4F42_414C).gen());
-        let moved = crate::globals::relocate(&mut pe, &analysis, &map, slot)
-            .with_context(|| format!("failed to apply global map {}", path.display()))?;
-        let _ = writeln!(report, "  globals  : {} moved (slot {slot})", moved.len());
+        let moved = crate::globals::relocate(&mut pe, &analysis, map.as_deref(), slot)
+            .with_context(|| match &cli.global_map {
+                Some(path) => format!("failed to apply global map {}", path.display()),
+                None => "failed to automatically relocate .data".to_owned(),
+            })?;
+        if cli.auto_globals {
+            let _ = writeln!(
+                report,
+                "  globals  : .data moved automatically (slot {slot})"
+            );
+        } else {
+            let _ = writeln!(report, "  globals  : {} moved (slot {slot})", moved.len());
+        }
         for (old, new) in moved {
             let _ = writeln!(report, "    RVA {old:#x} -> {new:#x}");
         }
@@ -208,7 +229,7 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
                     alias_probability: if cli.no_alias { 0.0 } else { cli.alias_prob },
                 },
                 alias_in_place,
-                cli.global_map.is_some(),
+                move_globals,
             )?;
             pass(
                 "basic block relocation",

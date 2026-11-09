@@ -1013,7 +1013,9 @@ fn visit_relocations(
             if e >> 12 == 0 {
                 continue; // IMAGE_REL_BASED_ABSOLUTE: padding
             }
-            let rva = page_rva.wrapping_add((e & 0xFFF) as u32);
+            let rva = page_rva
+                .checked_add((e & 0xFFF) as u32)
+                .context("base relocation RVA overflow")?;
             visit(e >> 12, rva)?;
         }
         off += block_size as usize;
