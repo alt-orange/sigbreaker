@@ -916,6 +916,70 @@ fn rebuilt_text_can_move_data_rvas_and_raw_offsets_without_new_sections() {
     assert!(pe.data[0x405..0x416].iter().all(|b| *b == 0xCC));
 }
 
+#[test]
+fn entry_jump_does_not_clobber_a_branch_target_reached_from_outside_the_window() {
+    // The 5-byte entry trampoline overwrites [start, start + 5). The first
+    // instruction (`test ecx, ecx`) is only two bytes, so the jump also clobbers
+    // the loop head at 0x1002. A `jg 0x1002` at 0x1007 still points there from
+    // outside the window, so the retained body would run a corrupted target. The
+    // function must be declined rather than relocated.
+    let code = [
+        0x85, 0xC9, // 0x1000  test ecx, ecx       (2 bytes; first instruction)
+        0xFF, 0xC9, // 0x1002  dec ecx             (loop head, inside the window)
+        0x83, 0xF9, 0x00, // 0x1004  cmp ecx, 0
+        0x7F, 0xF9, // 0x1007  jg 0x1002           (surviving source, outside the window)
+        0xC3, // 0x1009  ret
+    ];
+    let mut pe = fixture_code(&code);
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    assert_eq!(a.functions[0].blocks.len(), 3);
+    assert!(a.branch_sources.contains_key(&0x1002));
+    let snapshot = pe.data.clone();
+    let c = relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+    assert_eq!(c.applied, 0, "{c}");
+    assert_eq!(
+        c.skipped_reasons["entry jump would clobber a live interior target"], 1,
+        "{c}"
+    );
+    assert_eq!(pe.data, snapshot, "declined function must be left byte-for-byte");
+}
+
+#[test]
+fn entry_jump_may_relocate_when_the_only_window_source_is_overwritten_too() {
+    // Here the branch into the window (`jmp 0x1004`) lives at 0x1002, inside the
+    // trampoline's [start, start + 5) range, so it is overwritten together with
+    // the target it feeds: nothing survives to reach the clobbered bytes, and
+    // the function stays eligible. The two-block body is diversified through the
+    // unreachable-padding path.
+    let code = [
+        0x8B, 0x02, // 0x1000  mov eax, [rdx]      (2 bytes; first instruction)
+        0xEB, 0x00, // 0x1002  jmp 0x1004          (source inside the window)
+        0x01, 0xC0, // 0x1004  add eax, eax        (target inside the window)
+        0xC3, // 0x1006  ret
+    ];
+    let mut pe = fixture_code(&code);
+    let a = Analysis::run(pe.layout(), &pe.data).unwrap();
+    assert_eq!(a.functions[0].blocks.len(), 2);
+    let c = relayout::run_with_segments(
+        &a,
+        &mut pe,
+        1.0,
+        &mut StdRng::seed_from_u64(42),
+        None,
+        relayout::Options { junk_probability: 1.0, ..relayout::Options::default() },
+    )
+    .unwrap();
+    assert_eq!(c.applied, 1, "{c}");
+    assert_eq!(
+        c.skipped_reasons
+            .get("entry jump would clobber a live interior target")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "{c}"
+    );
+}
+
 
 
 

@@ -543,6 +543,43 @@ fn eligible(
         return Err("interior code reference");
     }
     let boundaries: BTreeSet<_> = f.blocks.iter().map(|b| b.start_rva).collect();
+    // The entry trampoline is a 5-byte `E9 rel32` jump stamped over the start of
+    // the function whenever the entry is not kept. It overwrites the byte range
+    // [start, start + 5). When the first instruction is shorter than the jump,
+    // those five bytes extend past it and clobber the leading byte(s) of the
+    // following instruction in the *retained* original body. The clobbered
+    // bytes are harmless only while nothing reaches them: the first instruction
+    // is dead (its only entry, `start`, becomes the trampoline), and a byte in
+    // the window is otherwise reached either by a fall-through the trampoline
+    // has severed, or by a branch that targets it. A branch target in the
+    // window is corrupted and still live if any of its sources survives the
+    // trampoline — i.e. lies outside the overwritten bytes. The relocated copy
+    // remaps that jump, but the retained body keeps it pointing at the clobbered
+    // target, and the retained body stays reachable (e.g. a function MSVC split
+    // across several .pdata fragments, entered through the chain, whose internal
+    // jump to a shared epilogue lands on the clobbered byte). When every source
+    // lies inside the window it is overwritten too, so the target is dead and
+    // safe. Decline relocation only when a surviving source keeps it live.
+    if !keep_entry {
+        let first_len = f
+            .blocks
+            .first()
+            .and_then(|b| b.instrs.first())
+            .map_or(0, |ins| ins.len as u32);
+        if first_len < 5 {
+            let overwritten = f.start_rva..f.start_rva + 5;
+            let window = f.start_rva + 1..f.start_rva + 5;
+            let live = analysis.branch_sources.range(window).any(|(_, sources)| {
+                sources.iter().any(|(_, src)| {
+                    let src_end = src.rva + src.len as u32;
+                    !(overwritten.start <= src.rva && src_end <= overwritten.end)
+                })
+            });
+            if live {
+                return Err("entry jump would clobber a live interior target");
+            }
+        }
+    }
     if f.resolved_indirect
         .values()
         .any(|t| !boundaries.contains(t))
