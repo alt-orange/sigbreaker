@@ -225,11 +225,10 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
                 segments.as_ref(),
                 relayout::Options {
                     junk_probability: cli.junk_prob,
-                    wipe_original: cli.wipe_original,
+                    wipe_original: cli.wipe_original && !cli.keep_original,
                     alias_probability: if cli.no_alias { 0.0 } else { cli.alias_prob },
                 },
                 alias_in_place,
-                move_globals,
             )?;
             pass(
                 "basic block relocation",
@@ -284,8 +283,38 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
         .output
         .clone()
         .unwrap_or_else(|| default_output(&cli.input));
+    let compressed = if cli.compress_section {
+        progress("Compressing the generated section with LZMA");
+        crate::compression::compress(&pe)?
+    } else {
+        None
+    };
+    if cli.compress_section {
+        match &compressed {
+            Some(packed) => {
+                let _ = writeln!(
+                    report,
+                    "  compression: {} LZMA {} -> {} bytes; file {} -> {} bytes",
+                    packed.section,
+                    packed.original_size,
+                    packed.packed_size,
+                    pe.data.len(),
+                    packed.data.len()
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    report,
+                    "  compression: skipped; no generated section with net size savings"
+                );
+            }
+        }
+    }
     progress("Writing output");
-    crate::writer::write_atomic(&out_path, &pe.data)
+    let output = compressed
+        .as_ref()
+        .map_or(pe.data.as_slice(), |packed| packed.data.as_slice());
+    crate::writer::write_atomic(&out_path, output)
         .with_context(|| format!("failed to write {}", out_path.display()))?;
     let _ = writeln!(report, "  output   : {}", out_path.display());
 

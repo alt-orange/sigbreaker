@@ -141,6 +141,54 @@ fn same_seed_same_output() {
     assert_eq!(r1, r2);
 }
 
+#[test]
+fn relocation_appends_and_wipes_original_code_with_any_section_name() {
+    let code = [
+        0x85, 0xC9, 0x74, 6, 0xB8, 1, 0, 0, 0, 0xC3, 0xB8, 2, 0, 0, 0, 0xC3,
+    ];
+    let mut data = TestPe::new().with_code(&code).data;
+    for (offset, value) in [
+        (0xE0, 0x2040u32),
+        (0xE4, 12),
+        (0x840, 0x1000),
+        (0x844, 0x1010),
+        (0x848, 0x2080),
+    ] {
+        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    data[0x880] = 1;
+    for name in [b".text", b".code"] {
+        data[0x148..0x14D].copy_from_slice(name);
+        let exe = TempExe::write(&data);
+        for (flags, keep) in [
+            (vec![], false),
+            (vec!["--keep-original"], true),
+            (vec!["--wipe-original"], false),
+            (vec!["--wipe-original", "--keep-original"], true),
+            (vec!["--keep-original", "--wipe-original"], false),
+        ] {
+            let mut args = vec!["--no-seg-inject", "--no-reorder", "--no-alias"];
+            args.extend(flags);
+            pipeline::run(&exe.cli(&args)).unwrap();
+            let pe = PeFile::parse(std::fs::read(out_path(&exe.path)).unwrap()).unwrap();
+            let layout = pe.layout();
+            let appended = layout.sections.last().unwrap();
+            assert_eq!(appended.name(), ".sbrk");
+            let off = layout.rva_to_offset(0x1000).unwrap();
+            let jump = Decoder::with_ip(64, &pe.data[off..], layout.va(0x1000), DecoderOptions::NONE)
+                .decode();
+            assert_eq!(jump.mnemonic(), Mnemonic::Jmp);
+            assert_eq!(jump.near_branch_target(), layout.va(appended.virtual_address));
+            let body = &pe.data[off + 5..off + code.len()];
+            if keep {
+                assert_eq!(body, &code[5..]);
+            } else {
+                assert_eq!(body, &[0xCC; 11]);
+            }
+        }
+    }
+}
+
 fn global_fixture() -> TempExe {
     let code = [
         0xB8, 1, 0, 0, 0, // mov eax, 1
@@ -194,6 +242,7 @@ fn global_slots_move_data_and_retarget_original_and_appended_code() {
             "--no-seg-inject",
             "--no-reorder",
             "--no-alias",
+            "--keep-original",
             "--junk-prob",
             "0",
         ]))

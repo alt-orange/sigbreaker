@@ -27,8 +27,9 @@ file. The map must describe the exact input image:
 target/release/sigbraker.exe app.exe --handler-map app.exe.map -o app.div.exe
 ```
 
-The default probabilities are `1.0`, growing prefixes are enabled, and the same
-input, options, seed, and build produce identical output. `--info` writes nothing.
+The default probabilities are `1.0`. Growing prefixes and original-body scrubbing
+are enabled. The same input, options, seed, and build produce identical output.
+`--info` writes nothing.
 Output is published by an adjacent temporary file and rename after validation.
 The report counts unique functions whose original code spans actually changed;
 header-only edits, rejected attempts, and reverted transformations are excluded.
@@ -45,7 +46,7 @@ header-only edits, rejected attempts, and reverted transformations are excluded.
 | Guarded EH | Sorted continuation-table rewriting; retained bodies keep their original targets alongside relocated targets |
 | Indirect branches | Constant register targets and bounded read-only absolute-VA, RVA, and signed-relative jump tables |
 | Interior references | Verified unchanged code-address values materialized by RIP-relative LEA; function-entry pointer identity stays stable |
-| PE layout | Existing `.text` growth, or an appended section with header expansion and raw-offset movement |
+| PE layout | Relocated functions in an appended executable section, with header expansion and raw-offset movement |
 | Global data | Explicitly mapped initialized objects move to appended data sections with patched references |
 
 FH3 IP-to-state maps and FH4 compressed state maps follow emitted instruction
@@ -73,22 +74,34 @@ exports, and existing CFG entry identities retain their original addresses.
 Block encoding preserves prologue bytes, relaxes branches, updates RIP-relative
 operands, and independently decodes generated code to check destinations/effects.
 
-For eligible layouts, the writer grows `.text`, rebases typed PE references,
-retires replaced runtime records, and fills obsolete bodies with `INT3` after
-the trampoline. The original section set is preserved on this path.
+Every relocated function is emitted into a uniquely named appended `.sbrk`
+executable section. Executable input sections may have any name. Existing RVAs
+remain fixed. Occupied header padding can be preserved by expanding the headers
+and moving raw sections. Certificate, debug, COFF, and section raw offsets are fixed.
+Overlay bytes and original unwind records are preserved. The writer fills
+original bodies with `INT3` behind entry jumps when its reference checks permit
+it. Live interior targets and embedded tables are protected. Guarded continuation
+tables retain surviving targets and add mapped targets. Moved VA fields reuse
+existing ASLR relocations. The complete result is reparsed before publication.
 
-When opaque metadata, additional executable sections, or interior fixups prevent
-that strategy, a uniquely named `.sbrk` section is appended. Existing RVAs remain
-fixed. Occupied header padding can be preserved by expanding the headers and
-moving raw sections. Certificate, debug, COFF, and section raw offsets are fixed.
-Overlay bytes are preserved. This path retains original bodies and unwind
-records because reference closure is incomplete. Guarded continuation tables
-retain old targets and add mapped targets; moved VA fields reuse existing ASLR
-relocations. The complete result is reparsed before publication.
-
-This fallback removes the previous opaque-exception rebuild rejections while
-leaving unrecognized handler functions in place. Compatibility of a whole image
+Unrecognized handler functions stay in place. Compatibility of a whole image
 is distinct from actually relocating its exception-handling functions.
+
+## Section compression
+
+Use `--compress-section` (alias `--compress`), or enable **Compress section** in
+the TUI, to store the largest generated `.sbrk*` section with LZMA:
+
+```powershell
+target/release/sigbraker.exe app.exe -o app.small.exe --compress-section
+```
+
+The embedded decoder restores the section before the original TLS callbacks
+and entry point execute. This option supports Windows user-mode x64 EXEs and
+DLLs. The loader retains access to imports, runtime entries, and guard tables.
+Compression is applied when the complete output is smaller after accounting
+for decoder and metadata storage. The report includes section and file sizes.
+Compressed outputs can be analyzed and processed again automatically.
 
 ## Options
 
@@ -106,7 +119,9 @@ is distinct from actually relocating its exception-handling functions.
 | `--no-reorder` | off | Disable scheduling |
 | `--no-alias` | off | Disable opcode aliasing |
 | `--no-shuffle` | off | Disable block shuffling |
-| `--wipe-original` | off | Scrub original bodies behind entry jumps when relocation appends a section. With junk enabled, eligible calls in retained bodies can jump to their relocated copies |
+| `--wipe-original` | on | Scrub eligible original bodies behind entry jumps. With junk enabled, eligible calls in retained bodies can jump to their relocated copies |
+| `--keep-original` | off | Retain original bodies behind entry jumps |
+| `--compress-section` | off | LZMA compression of generated code with an embedded startup decoder |
 | `--handler-map` | none | Matching linker map for static handlers |
 | `--global-map` | none | Map of initialized globals to move and their RIP-relative reference sites |
 | `--auto-globals` | off | Move the writable `.data` section using only the input PE |

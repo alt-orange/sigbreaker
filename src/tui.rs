@@ -243,7 +243,8 @@ impl App {
                 Field::toggle("Opcode aliasing", "--no-alias", true),
                 Field::toggle("Instruction order", "--no-reorder", true),
                 Field::toggle("Block shuffle", "--no-shuffle", true),
-                Field::toggle("Wipe old code", "--wipe-original", false),
+                Field::toggle("Wipe old code", "--keep-original", true),
+                Field::toggle("Compress section", "--compress-section", false),
                 Field::toggle("Verify output", "--no-verify", true),
                 Field::text("Segments", "--segments", "es,cs,ss,ds"),
                 Field::text("Segment chance", "--seg-prob", "1.0"),
@@ -494,5 +495,31 @@ impl App {
             self.report_offset.min(max_offset)
         };
         frame.render_widget(report.scroll((self.report_offset, 0)), body);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wiping_defaults_on_and_can_be_disabled() {
+        let mut app = App::new();
+        if let Value::Text { editor, .. } = &mut app.fields[0].value {
+            editor.text = "input.exe".to_owned();
+        }
+        let defaults = app.args(false).unwrap();
+        assert!(defaults.wipe_original);
+        assert!(!defaults.keep_original);
+
+        let field = app
+            .fields
+            .iter_mut()
+            .find(|f| f.flag == "--keep-original")
+            .unwrap();
+        if let Value::Toggle { enabled, .. } = &mut field.value {
+            *enabled = false;
+        }
+        assert!(app.args(false).unwrap().keep_original);
     }
 }

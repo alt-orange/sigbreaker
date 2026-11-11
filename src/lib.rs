@@ -26,6 +26,7 @@
 
 pub mod analysis;
 pub mod cli;
+mod compression;
 pub mod cpp_eh;
 pub mod dependencies;
 pub mod exception;

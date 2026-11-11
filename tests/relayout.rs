@@ -4,7 +4,6 @@ use common::TestPe;
 use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
 use rand::{rngs::StdRng, SeedableRng};
 use sigbraker::{analysis::Analysis, pe::PeFile, transforms::relayout};
-use std::collections::BTreeSet;
 
 fn fixture() -> PeFile {
     let code = [
@@ -120,18 +119,7 @@ fn wipe_ignores_relocation_records_but_preserves_fixup_targets() {
         let mut pe = PeFile::parse_with_symbols(data.clone(), [(0x1000, "entry".into())].into())
             .unwrap();
         let a = Analysis::run(pe.layout(), &pe.data).unwrap();
-        let c = relayout::run_with_segments(
-            &a,
-            &mut pe,
-            1.0,
-            &mut StdRng::seed_from_u64(42),
-            None,
-            relayout::Options {
-                wipe_original: true,
-                ..relayout::Options::default()
-            },
-        )
-        .unwrap();
+        let c = relayout::run(&a, &mut pe, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
         assert_eq!(c.applied, 1);
         assert_eq!(pe.layout().sections.last().unwrap().name(), ".sbrk");
         let old = pe.layout().rva_to_offset(0x1000).unwrap();
@@ -271,7 +259,7 @@ fn opaque_metadata_fallback_expands_headers_and_preserves_rvas_and_overlay() {
     assert_eq!(pe.data[old_entry], 0xE9);
     assert_eq!(
         &pe.data[old_entry + 5..old_entry + 16],
-        &before.data[0x405..0x410]
+        &[0xCC; 11]
     );
     let certificate = u32::from_le_bytes(pe.data[0xE8..0xEC].try_into().unwrap()) as usize;
     assert_eq!(&pe.data[certificate..certificate + 16], b"certificate-data");
@@ -466,7 +454,7 @@ fn planner_preserves_external_rip_memory_target() {
 }
 
 #[test]
-fn absolute_interior_code_pointer_prevents_movement() {
+fn absolute_interior_code_pointer_preserves_the_original_body() {
     let mut bytes = fixture().data;
     bytes[0x810..0x818].copy_from_slice(&0x14000100Au64.to_le_bytes());
     bytes[0xC08..0xC0A].copy_from_slice(&0xA010u16.to_le_bytes());
@@ -474,8 +462,12 @@ fn absolute_interior_code_pointer_prevents_movement() {
     let a = Analysis::run(p.layout(), &p.data).unwrap();
     assert!(a.range_externally_referenced(0, 0x1001..0x1010));
     let c = relayout::run(&a, &mut p, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
-    assert_eq!(c.applied, 0);
-    assert_eq!(bytes, p.data);
+    assert_eq!(c.applied, 1);
+    assert_eq!(c.wiped_original, 0);
+    let old = p.layout().rva_to_offset(0x1000).unwrap();
+    assert_eq!(&p.data[old + 5..old + 16], &bytes[0x405..0x410]);
+    let pointer = p.layout().rva_to_offset(0x2010).unwrap();
+    assert_eq!(&p.data[pointer..pointer + 8], &0x14000100Au64.to_le_bytes());
 }
 
 #[test]
@@ -534,10 +526,11 @@ fn expanded_layout_preserves_both_paths_and_publishes_unwind_entries() {
     let c = relayout::run(&a, &mut p, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
     assert_eq!(c.applied, 1);
     assert!(p.data.len() > original.len());
-    assert_eq!(p.layout().runtime_functions.len(), 1);
-    assert_eq!(p.layout().sections.len(), 3);
+    assert_eq!(p.layout().runtime_functions.len(), 2);
+    assert_eq!(p.layout().sections.len(), 4);
     assert_eq!(p.layout().sections[0].name(), ".text");
-    assert!(p.layout().sections[0].raw_size > 0x200);
+    assert_eq!(p.layout().sections[0].raw_size, 0x200);
+    assert_eq!(p.layout().sections.last().unwrap().name(), ".sbrk");
     assert!(p.data[0x405..0x410].iter().all(|b| *b == 0xCC));
     assert_ne!(&p.data[0x400..0x410], &original[0x400..0x410]);
     assert_eq!(evaluate(&p, false), 1);
@@ -565,24 +558,26 @@ fn occupied_header_slot_and_overlay_are_preserved() {
     let a = Analysis::run(p.layout(), &p.data).unwrap();
     let c = relayout::run(&a, &mut p, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
     assert_eq!(c.applied, 1);
-    assert!(p.data[0x1C0..0x1E8].iter().all(|b| *b == 0xA5));
+    assert!(p.data[0x3C0..0x3E8].iter().all(|b| *b == 0xA5));
     assert!(p.data.ends_with(b"overlay survives text growth"));
 }
 
 #[test]
-fn text_grows_without_a_new_header_or_executable_section() {
+fn relocation_appends_an_executable_section_and_preserves_text_size() {
     let mut p = fixture();
     p.data[0x1C0..0x1E8].fill(0xA5);
     let original = p.data.clone();
     let a = Analysis::run(p.layout(), &p.data).unwrap();
     let c = relayout::run(&a, &mut p, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
     assert_eq!(c.applied, 1);
-    assert_eq!(p.layout().sections.len(), 3);
-    assert!(p.data[0x405..0x410].iter().all(|b| *b == 0xCC));
-    assert_ne!(&p.data[0x400..0x410], &original[0x400..0x410]);
+    assert_eq!(p.layout().sections.len(), 4);
+    assert_eq!(p.layout().sections[0].raw_size, 0x200);
+    let old = p.layout().rva_to_offset(0x1000).unwrap();
+    assert!(p.data[old + 5..old + 16].iter().all(|b| *b == 0xCC));
+    assert_ne!(&p.data[old..old + 16], &original[0x400..0x410]);
     assert_eq!(evaluate(&p, true), 2);
     assert_eq!(evaluate(&p, false), 1);
-    assert!(!p.layout().sections.last().unwrap().is_executable());
+    assert!(p.layout().sections.last().unwrap().is_executable());
 }
 
 #[test]
@@ -595,14 +590,14 @@ fn reprocessing_preserves_entry_chain_and_behavior() {
         assert_eq!(evaluate(&p, true), 2);
         assert_eq!(evaluate(&p, false), 1);
     }
-    assert_eq!(p.layout().sections.len(), 3);
+    assert_eq!(p.layout().sections.len(), 6);
     assert_eq!(
         p.layout()
             .sections
             .iter()
             .filter(|s| s.is_executable())
             .count(),
-        1
+        4
     );
 }
 
@@ -865,7 +860,7 @@ fn rebuilt_text_can_move_data_rvas_and_raw_offsets_without_new_sections() {
     data.extend_from_slice(b"testcert");
     let mut pe = PeFile::parse(data).unwrap();
     let a = Analysis::run(pe.layout(), &pe.data).unwrap();
-    let plan = sigbraker::writer::SectionPlan::new(&pe).unwrap();
+    let plan = sigbraker::writer::SectionPlan::new_with_address_rewrites(&pe, false).unwrap();
     let start = plan.rva;
     let encoded =
         relayout::encode_function(&a.functions[0], pe.layout().va(start), &[0, 2, 1], &pe.data, usize::MAX, None)

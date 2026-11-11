@@ -121,6 +121,68 @@ fn fh3_and_fh4_state_maps_follow_shuffled_instruction_spans() {
 }
 
 #[test]
+fn fh3_relocated_catch_keeps_its_handler_identity_and_parent_frame_offset() {
+    let mut data = fixture(false);
+    let catch_code = data[0x400..0x410].to_vec();
+    data[0x5D0..0x5E0].copy_from_slice(&catch_code);
+    for (at, value) in [
+        (0xE4, 24),
+        (0x94C, 0x11D0),
+        (0x950, 0x11E0),
+        (0x954, 0x20D0),
+        (0xC04, 3),
+        (0xC0C, 1),
+        (0xC10, 0x30B0),
+        (0xC14, 4),
+        (0xC50, u32::MAX),
+        (0xC98, 0x11D0),
+        (0xC9C, 2),
+        (0xCB0, 0),
+        (0xCB4, 1),
+        (0xCB8, 2),
+        (0xCBC, 1),
+        (0xCC0, 0x30D0),
+        (0xCD0, 0x40), // handler adjectives
+        (0xCD8, 0x18), // catch object displacement
+        (0xCDC, 0x11D0),
+        (0xCE0, 0x28), // parent frame displacement
+    ] {
+        put(&mut data, at, value);
+    }
+    let original_handler = data[0xCD0..0xCE4].to_vec();
+    let mut pe = PeFile::parse(data).unwrap();
+    let analysis = Analysis::run(pe.layout(), &pe.data).unwrap();
+    let counters = relayout::run(&analysis, &mut pe, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
+    assert_eq!(counters.relocated_fh3, 2);
+
+    let original = pe.layout().rva_to_offset(0x30D0).unwrap();
+    assert_eq!(&pe.data[original..original + 20], &original_handler);
+    let relocated: Vec<_> = pe
+        .layout()
+        .cpp_eh
+        .values()
+        .filter(|cpp| cpp.function.start >= 0x4000)
+        .collect();
+    assert_eq!(relocated.len(), 2);
+    for cpp in relocated {
+        let info = pe.layout().unwind_info(cpp.function.start).unwrap();
+        let unwind = pe.layout().rva_to_offset(info.rva).unwrap();
+        let language = unwind + 4 + (pe.data[unwind + 2] as usize).div_ceil(2) * 4 + 4;
+        let read_rva = |at| u32::from_le_bytes(pe.data[at..at + 4].try_into().unwrap());
+        let func_info = pe.layout().rva_to_offset(read_rva(language)).unwrap();
+        let tries = pe.layout().rva_to_offset(read_rva(func_info + 16)).unwrap();
+        let handler = pe.layout().rva_to_offset(read_rva(tries + 16)).unwrap();
+        assert_eq!(&pe.data[handler..handler + 12], &original_handler[..12]);
+        assert_eq!(&pe.data[handler + 16..handler + 20], &original_handler[16..]);
+        let is_catch = cpp.states.iter().all(|&(_, state)| state == 2);
+        assert_eq!(
+            read_rva(handler + 12),
+            if is_catch { cpp.function.start } else { 0x11D0 }
+        );
+    }
+}
+
+#[test]
 fn malformed_cpp_tables_fail_closed_and_unknown_identity_is_not_guessed() {
     for (fh4, at, value) in [
         (false, 0xC00, 0),

@@ -169,19 +169,32 @@ fn guarded_continuation_table_is_rewritten_and_sorted_with_scope_targets() {
         .layout()
         .eh_continuations
         .contains(&scope.scopes[0].target));
-    // An append layout retains the old body and needs both sets of targets.
+    // The default append layout drops targets in scrubbed or overwritten bytes.
     let symbols = std::collections::BTreeMap::from([(0x11C0, "__C_specific_handler".to_owned())]);
     let mut appended = PeFile::parse_with_symbols(d.clone(), symbols).unwrap();
     let a = Analysis::run(appended.layout(), &appended.data).unwrap();
     relayout::run(&a, &mut appended, 1.0, &mut StdRng::seed_from_u64(42)).unwrap();
-    assert_eq!(appended.layout().eh_continuations.len(), 4);
-    assert!(appended.layout().eh_continuations.contains(&0x1004));
-    assert!(appended.layout().eh_continuations.contains(&0x100A));
-    assert!(appended
-        .layout()
-        .eh_continuations
-        .iter()
-        .any(|r| *r >= 0x4000));
+    assert_eq!(appended.layout().eh_continuations.len(), 2);
+    assert!(appended.layout().eh_continuations.iter().all(|r| *r >= 0x4000));
+
+    // Keeping the body also keeps its surviving original continuation.
+    let mut retained = PeFile::parse(d.clone()).unwrap();
+    let a = Analysis::run(retained.layout(), &retained.data).unwrap();
+    relayout::run_with_segments(
+        &a,
+        &mut retained,
+        1.0,
+        &mut StdRng::seed_from_u64(42),
+        None,
+        relayout::Options {
+            wipe_original: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(retained.layout().eh_continuations.len(), 3);
+    assert!(!retained.layout().eh_continuations.contains(&0x1004));
+    assert!(retained.layout().eh_continuations.contains(&0x100A));
     for values in [[0x100A, 0x1004], [0x1004, 0x1004], [0x1004, 0x4000]] {
         let mut invalid = d.clone();
         put(&mut invalid, 0xD80, values[0]);

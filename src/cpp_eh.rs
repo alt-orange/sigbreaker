@@ -21,7 +21,10 @@ pub struct CppEh {
 }
 #[derive(Clone, Debug)]
 enum Format {
-    Fh3(Vec<u8>),
+    Fh3 {
+        info: Vec<u8>,
+        tries: Vec<Try3>,
+    },
     Fh4 {
         header: u8,
         bbt: u32,
@@ -30,6 +33,11 @@ enum Format {
         tries: Vec<Try4>,
         segments: Vec<(u32, u32)>,
     },
+}
+#[derive(Clone, Debug)]
+struct Try3 {
+    states: [u32; 3],
+    handlers: Vec<[u8; 20]>,
 }
 #[derive(Clone, Debug)]
 struct Try4 {
@@ -122,17 +130,18 @@ impl Reader<'_> {
         }
         Ok(())
     }
-    fn handlers3(&mut self, rva: u32, count: u32) -> Result<()> {
+    fn handlers3(&mut self, rva: u32, count: u32) -> Result<Vec<[u8; 20]>> {
         let n = self.count(count)?;
         let raw = self.raw(
             rva,
             n.checked_mul(20).context("FH3 handler count overflow")?,
         )?;
-        for h in raw.as_chunks::<20>().0 {
+        let handlers = raw.as_chunks::<20>().0.to_vec();
+        for h in &handlers {
             self.type_rva(get(h, 4))?;
             self.code(get(h, 12))?;
         }
-        Ok(())
+        Ok(handlers)
     }
     fn handlers4(&mut self, mut cursor: u32, function: &Range<u32>) -> Result<Vec<Handler4>> {
         let n = self.compressed_count(&mut cursor)?;
@@ -277,11 +286,15 @@ pub fn parse(
             get(&raw, 16),
             n.checked_mul(20).context("FH3 try count overflow")?,
         )?;
+        let mut try_blocks = Vec::new();
         for t in tries.as_chunks::<20>().0 {
             if get(t, 0) > get(t, 4) || get(t, 4) > get(t, 8) {
                 bail!("invalid FH3 try states");
             }
-            r.handlers3(get(t, 16), get(t, 12))?;
+            try_blocks.push(Try3 {
+                states: [get(t, 0), get(t, 4), get(t, 8)],
+                handlers: r.handlers3(get(t, 16), get(t, 12))?,
+            });
         }
         let n = r.count(get(&raw, 20))?;
         let ips = r.raw(
@@ -299,7 +312,10 @@ pub fn parse(
             let list = r.raw(est, 8)?;
             r.handlers3(get(&list, 4), get(&list, 0))?;
         }
-        Format::Fh3(raw)
+        Format::Fh3 {
+            info: raw,
+            tries: try_blocks,
+        }
     } else {
         let header = r.byte(&mut cursor)?;
         if header & 0x80 != 0 {
@@ -442,9 +458,9 @@ impl CppEh {
             if self.function.contains(&old) {
                 Ok(u32::try_from(
                     map.get(&(base + old as u64))
-                        .context("unmapped FH4 continuation")?
+                        .context("unmapped C++ handler or continuation")?
                         .checked_sub(base)
-                        .context("FH4 PC underflow")?,
+                        .context("C++ PC underflow")?,
                 )?)
             } else {
                 Ok(old)
@@ -460,13 +476,38 @@ impl CppEh {
         word(&mut out, rva_at(info_offset)?);
         out.extend_from_slice(&self.gs_data);
         match &self.format {
-            Format::Fh3(raw) => {
-                out.extend_from_slice(raw);
+            Format::Fh3 { info, tries } => {
+                out.extend_from_slice(info);
                 set(&mut out, info_offset + 20, u32::try_from(states.len())?);
                 set(&mut out, info_offset + 24, rva_at(info_offset + 40)?);
                 for (ip, state) in states {
                     word(&mut out, ip);
                     word(&mut out, state as u32);
+                }
+                if !tries.is_empty() {
+                    let offset = out.len();
+                    set(&mut out, info_offset + 16, rva_at(offset)?);
+                    let mut handler_fields = Vec::new();
+                    for t in tries {
+                        for state in t.states {
+                            word(&mut out, state);
+                        }
+                        word(&mut out, u32::try_from(t.handlers.len())?);
+                        handler_fields.push(out.len());
+                        word(&mut out, 0);
+                    }
+                    for (t, field) in tries.iter().zip(handler_fields) {
+                        let offset = out.len();
+                        set(&mut out, field, rva_at(offset)?);
+                        for h in &t.handlers {
+                            out.extend_from_slice(&h[..12]);
+                            // FH3 compares this RVA with the active funclet's
+                            // RUNTIME_FUNCTION.BeginAddress to recover its parent
+                            // frame. A trampoline cannot preserve that identity.
+                            word(&mut out, mapped(get(h, 12))?);
+                            out.extend_from_slice(&h[16..]);
+                        }
+                    }
                 }
             }
             Format::Fh4 {

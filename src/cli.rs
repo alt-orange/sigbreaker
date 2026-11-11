@@ -41,8 +41,8 @@ with transformations intended to preserve behavior:\n\
   - equivalent encodings for selected instructions and relocated stack restores\n\
   - DAG-based instruction reordering inside basic blocks\n\
   - basic block shuffling with explicit control-flow patching\n\n\
-Supported functions grow in .text or an appended section. Existing data RVAs \
-are preserved on the append path, apart from data moved by the global options. \
+Relocated functions are emitted into an appended executable section. Existing data RVAs \
+are preserved, apart from data moved by the global options. \
 Named FH3/FH4 and SEH \
 handlers, explicit static-handler maps, bounded indirect targets, and guarded \
 continuations are supported. Unknown formats stay pinned. Structural verification is not a proof of \
@@ -102,11 +102,18 @@ pub struct Cli {
     #[arg(long, default_value_t = 1.0)]
     pub junk_prob: f64,
 
-    /// Scrub the retained original body of every relocated function whose
-    /// reference closure is provably clean. Functions whose interiors are
-    /// still referenced through non-re-encodable edges keep their bodies.
-    #[arg(long)]
+    /// Scrub eligible original bodies after relocation (enabled by default).
+    /// Live interior references and embedded tables can require retaining bytes.
+    #[arg(long, action = clap::ArgAction::SetTrue, default_value_t = true, overrides_with = "keep_original")]
     pub wipe_original: bool,
+
+    /// Preserve original bodies behind entry jumps.
+    #[arg(long, overrides_with = "wipe_original")]
+    pub keep_original: bool,
+
+    /// Store the generated .sbrk section with LZMA and restore it during TLS startup.
+    #[arg(long, alias = "compress")]
+    pub compress_section: bool,
 
     /// Probability [0, 1] of using an equivalent encoding for an eligible instruction.
     #[arg(long, default_value_t = 1.0)]

@@ -131,10 +131,6 @@ impl PeLayout {
             .map(|index| &self.runtime_functions[index])
     }
 
-    pub(crate) fn runtime_function_containing(&self, rva: u32) -> Option<&Range<u32>> {
-        let index = self.runtime_functions.partition_point(|r| r.end <= rva);
-        self.runtime_functions.get(index).filter(|r| r.contains(&rva))
-    }
     /// Virtual address of an RVA.
     pub fn va(&self, rva: u32) -> u64 {
         self.image_base.wrapping_add(rva as u64)
@@ -297,6 +293,7 @@ impl PeFile {
         data: Vec<u8>,
         handler_symbols: BTreeMap<u32, String>,
     ) -> Result<PeFile> {
+        let data = crate::compression::unpack(&data)?.unwrap_or(data);
         let len = data.len();
         if len < 0x40 {
             bail!("file too small to be a PE image ({len} bytes)");
@@ -796,24 +793,27 @@ impl PeFile {
 
     /// Recomputes and stores the PE optional-header checksum.
     pub fn update_checksum(&mut self) {
-        let off = self.layout.checksum_off;
-        self.data[off..off + 4].fill(0);
-
-        let mut acc: u64 = 0;
-        let (pairs, tail) = self.data.as_chunks::<2>();
-        for pair in pairs {
-            acc += u16::from_le_bytes(*pair) as u64;
-        }
-        if let Some(&last) = tail.first() {
-            acc += last as u64;
-        }
-        // Fold the accumulator into 16 bits, then combine with the file size.
-        while acc > 0xFFFF {
-            acc = (acc & 0xFFFF) + (acc >> 16);
-        }
-        let checksum = (acc as u32).wrapping_add(self.data.len() as u32);
-        self.data[off..off + 4].copy_from_slice(&checksum.to_le_bytes());
+        update_checksum_at(&mut self.data, self.layout.checksum_off);
     }
+}
+
+pub(crate) fn update_checksum_at(data: &mut [u8], off: usize) {
+    data[off..off + 4].fill(0);
+
+    let mut acc: u64 = 0;
+    let (pairs, tail) = data.as_chunks::<2>();
+    for pair in pairs {
+        acc += u16::from_le_bytes(*pair) as u64;
+    }
+    if let Some(&last) = tail.first() {
+        acc += last as u64;
+    }
+    // Fold the accumulator into 16 bits, then combine with the file size.
+    while acc > 0xFFFF {
+        acc = (acc & 0xFFFF) + (acc >> 16);
+    }
+    let checksum = (acc as u32).wrapping_add(data.len() as u32);
+    data[off..off + 4].copy_from_slice(&checksum.to_le_bytes());
 }
 
 fn u16_le(d: &[u8], off: usize) -> Result<u16> {

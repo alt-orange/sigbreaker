@@ -1,4 +1,4 @@
-//! Rebuild .text with generated code; preserve the original section set.
+//! Write generated code by growing .text or appending an executable section.
 use crate::pe::PeFile;
 use std::io::Write;
 use std::path::Path;
@@ -88,20 +88,16 @@ impl SectionPlan {
     pub fn retains_original_bodies(&self) -> bool {
         self.append_section
     }
+    /// Plan a new executable section while preserving existing virtual addresses.
     pub fn new(pe: &PeFile) -> Result<Self> {
-        Self::new_with_address_rewrites(pe, false)
+        Self::new_with_address_rewrites(pe, true)
     }
     pub fn new_with_address_rewrites(pe: &PeFile, force_append: bool) -> Result<Self> {
         let opt = u32_at(&pe.data, 0x3C)? as usize + 24;
-        let text = pe
-            .layout()
-            .sections
-            .iter()
-            .find(|s| s.name() == ".text" && s.is_executable())
-            .context("output rebuild requires .text")?;
         // Opaque language metadata cannot be rebased when .text pushes data
         // sections to new RVAs. Append a section instead, preserving every
         // existing RVA and retaining bodies whose reference closure is unknown.
+        let text = pe.layout().executable_sections().find(|s| s.name() == ".text");
         let append_section = pe.layout().runtime_functions.iter().any(|f| {
             pe.layout().unwind_info(f.start).is_some_and(|info| {
                 matches!(info.kind, crate::pe::UnwindKind::Unsupported { .. })
@@ -111,21 +107,22 @@ impl SectionPlan {
         }) || pe.layout().executable_sections().count() != 1
             || !pe.layout().handler_symbols.is_empty()
             || force_append;
-        let rva = if append_section {
-            next_section_rva(pe)?
-        } else {
-            text.virtual_address
-                .checked_add(text.raw_size)
-                .context(".text append RVA overflow")?
-        };
-        Ok(Self {
-            rva,
-            opt,
-            append_section,
-        })
+        match text.filter(|_| !append_section) {
+            Some(text) => Ok(Self {
+                rva: text.virtual_address
+                    .checked_add(text.raw_size)
+                    .context(".text append RVA overflow")?,
+                opt,
+                append_section: false,
+            }),
+            None => Ok(Self {
+                rva: next_section_rva(pe)?,
+                opt,
+                append_section: true,
+            }),
+        }
     }
-    /// Rebuild the existing .text section, moving later raw data and rebasing
-    /// supported address-bearing PE structures. Function sizes are unrestricted.
+    /// Publish generated code using the planned section layout.
     pub fn commit(
         self,
         pe: &mut PeFile,
@@ -153,7 +150,7 @@ impl SectionPlan {
             .layout()
             .sections
             .iter()
-            .find(|s| s.name() == ".text")
+            .find(|s| s.name() == ".text" && s.is_executable())
             .context("missing .text")?;
         let replaced: std::collections::BTreeSet<_> = patches
             .iter()
@@ -423,10 +420,10 @@ impl SectionPlan {
 }
 
 pub(crate) struct RawShift {
-    slot: usize,
-    header_growth: usize,
-    insert: usize,
-    insertion_size: usize,
+    pub(crate) slot: usize,
+    pub(crate) header_growth: usize,
+    pub(crate) insert: usize,
+    pub(crate) insertion_size: usize,
 }
 
 impl RawShift {

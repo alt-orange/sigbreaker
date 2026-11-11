@@ -25,10 +25,11 @@ instruction maps exist. Arithmetic on code addresses does not establish a
 rewritable pointer. Unknown register writes, joins, and missing table bounds
 invalidate indirect-target facts.
 
-The `.text` rebuild path retires obsolete bodies and runtime entries under its
-existing classification/rebasing checks. The append path preserves original
-RVAs, bodies, and runtime entries. Its growing guarded-continuation table keeps
-both old and relocated targets. New absolute load-config values require an
+The relocation pass always emits into an appended executable section. Input
+executable sections may have any name. Original RVAs and runtime entries are
+preserved. By default the writer scrubs original bodies that pass the reference
+checks, and its guarded-continuation table keeps surviving and relocated
+targets. New absolute load-config values require an
 existing ASLR relocation when the image enables dynamic base relocation.
 
 Static handler support requires a matching explicit linker map. Merely accepting
@@ -36,6 +37,13 @@ an image with an opaque handler is not evidence that this handler moved. The
 native C++ runner separately asserts actual exported exception-parent relocation.
 
 ## Local validation evidence
+
+The optional section-compression path embeds the public-domain LZMA SDK 25.01
+decoder. Its source is in `src/compression/decoder.c`; regenerate the checked-in
+Windows x64 code and unwind metadata with `python scripts/build_section_decoder.py`.
+Normal Cargo builds use the embedded bytes. `scripts/validate_section_compression.py`
+executes compressed EXE/DLL fixtures, including a live ASLR pointer probe,
+guarded EH, nested C++ rethrows, threads, stack walking, and repeat processing.
 
 Completed local runs before the final edge-case checks:
 

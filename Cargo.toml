@@ -24,6 +24,7 @@ tui = ["dep:ratatui"]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 iced-x86 = { version = "1.22", features = ["decoder", "encoder", "instr_info"] }
+lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder"] }
 rand = "0.8"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "unstable-rendered-line-info"], optional = true }
 

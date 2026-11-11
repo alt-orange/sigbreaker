@@ -382,9 +382,6 @@ fn import_tail(ins: &Instruction, pe: &PeLayout) -> bool {    ins.is_jmp_near_in
             .and_then(|r| u32::try_from(r).ok())
             .is_some_and(|r| pe.import_slots.contains(&r))
 }
-fn layout_interior(pe: &PeLayout, rva: u32) -> bool {
-    pe.runtime_function_containing(rva).is_some_and(|f| f.start < rva)
-}
 
 #[derive(Default)]
 struct LayoutConstraints {
@@ -804,14 +801,24 @@ fn eligible(
 }
 
 /// Behavior switches for the relocation pass beyond plain block shuffling.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct Options {
     /// Probability [0, 1] of padding each unreachable gap with inert filler.
     pub junk_probability: f64,
-    /// Scrub proven-clean retained original bodies behind their trampolines.
+    /// Scrub proven-clean original bodies behind their trampolines (default on).
     pub wipe_original: bool,
     /// Probability [0, 1] of aliasing each relocated instruction's opcode.
     pub alias_probability: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            junk_probability: 0.0,
+            wipe_original: true,
+            alias_probability: 0.0,
+        }
+    }
 }
 
 pub fn run(
@@ -831,7 +838,7 @@ pub fn run_with_segments(
     segments: Option<&super::segment_inject::Config>,
     options: Options,
 ) -> Result<Counters> {
-    run_with_alias_state(analysis, pe, probability, rng, segments, options, false, false)
+    run_with_alias_state(analysis, pe, probability, rng, segments, options, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -843,7 +850,6 @@ pub(crate) fn run_with_alias_state(
     segments: Option<&super::segment_inject::Config>,
     options: Options,
     aliased_in_place: bool,
-    force_append: bool,
 ) -> Result<Counters> {
     let mut c = Counters::default();
     if (probability == 0.0 && segments.is_none()) || pe.layout().runtime_functions.is_empty() {
@@ -851,15 +857,7 @@ pub(crate) fn run_with_alias_state(
         // there is nothing to pad.
         return Ok(c);
     }
-    let plan = SectionPlan::new_with_address_rewrites(
-        pe,
-        force_append
-            || analysis
-                .address_references
-                .keys()
-                .any(|r| layout_interior(pe.layout(), *r))
-            || analysis.functions.iter().any(|f| !f.jump_tables.is_empty()),
-    )?;
+    let plan = SectionPlan::new(pe)?;
     let layout = pe.layout();
     let mut table_bytes: Vec<_> = analysis
         .functions
@@ -1535,6 +1533,9 @@ pub(crate) fn run_with_alias_state(
                 targets.extend(layout.eh_continuations.iter().copied().filter(|r| {
                     layout.rva_to_offset(*r).is_none_or(|off| {
                         !wipes.iter().any(|&(start, len)| (start..start + len).contains(&off))
+                            && !patches.iter().any(|(start, bytes)| {
+                                *start < off && off < start + bytes.len()
+                            })
                     })
                 }));
             }
