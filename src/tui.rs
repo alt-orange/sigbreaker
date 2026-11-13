@@ -14,10 +14,14 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style, Stylize};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, List, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use sigbraker::{cli::Cli, pipeline};
+use sigbraker::{
+    cli::Cli,
+    pipeline,
+    report::{self, LineKind},
+};
 
 pub(crate) fn run() -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -222,6 +226,7 @@ struct App {
     report: String,
     report_offset: u16,
     report_height: u16,
+    report_expanded: bool,
     follow: bool,
     status: Status,
     job: Option<Job>,
@@ -258,6 +263,7 @@ impl App {
                 .to_owned(),
             report_offset: 0,
             report_height: 1,
+            report_expanded: false,
             follow: false,
             status: Status::Ready,
             job: None,
@@ -285,6 +291,7 @@ impl App {
         self.report.clear();
         match self.spawn(info) {
             Ok(job) => {
+                self.report.push_str("Progress\n\n");
                 self.job = Some(job);
                 self.status = Status::Running;
                 self.follow = true;
@@ -315,6 +322,7 @@ impl App {
         while let Some(job) = &self.job {
             match job.updates.try_recv() {
                 Ok(Update::Stage(stage)) => {
+                    self.report.push_str("  > ");
                     self.report.push_str(&stage);
                     self.report.push('\n');
                 }
@@ -373,6 +381,10 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::F(6) {
+            self.report_expanded = !self.report_expanded;
+            return false;
+        }
         let page = self.report_height.saturating_sub(1).max(1);
         if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
             self.follow = false;
@@ -391,14 +403,16 @@ impl App {
             (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
             (KeyCode::F(2), _) => self.start(true),
             (KeyCode::F(5), _) => self.start(false),
-            (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab | KeyCode::Up, _) => {
+            (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab | KeyCode::Up, _)
+                if !self.report_expanded =>
+            {
                 self.focus
                     .select(Some((selected + self.fields.len() - 1) % self.fields.len()));
             }
-            (KeyCode::Tab | KeyCode::Down, _) => {
+            (KeyCode::Tab | KeyCode::Down, _) if !self.report_expanded => {
                 self.focus.select(Some((selected + 1) % self.fields.len()));
             }
-            _ => match &mut self.fields[selected].value {
+            _ if !self.report_expanded => match &mut self.fields[selected].value {
                 Value::Text { editor, .. } => editor.key(key),
                 Value::Toggle { enabled, .. }
                     if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) =>
@@ -407,6 +421,7 @@ impl App {
                 }
                 _ => {}
             },
+            _ => {}
         }
         false
     }
@@ -433,19 +448,35 @@ impl App {
             ]),
             header,
         );
-        let columns = [Constraint::Percentage(43), Constraint::Percentage(57)];
-        let [config, report] = if area.width >= 100 {
-            Layout::horizontal(columns).areas(body)
+        if self.report_expanded {
+            self.draw_report(frame, body, color);
         } else {
-            Layout::vertical([Constraint::Percentage(56), Constraint::Percentage(44)]).areas(body)
-        };
-        self.draw_config(frame, config);
-        self.draw_report(frame, report, color);
+            let [config, report] = if area.width >= 110 {
+                Layout::horizontal([Constraint::Length(40), Constraint::Fill(1)]).areas(body)
+            } else {
+                Layout::vertical([Constraint::Percentage(40), Constraint::Fill(1)]).areas(body)
+            };
+            self.draw_config(frame, config);
+            self.draw_report(frame, report, color);
+        }
         let keys = if self.job.is_some() {
-            " Processing the current configuration\n PgUp/PgDn scroll report"
+            " Processing the current configuration"
+        } else if self.report_expanded {
+            " F2 inspect   F5 process   Esc quit"
         } else {
-            " Tab/↑↓ select   Space toggle   F2 inspect   F5 process   Esc quit\n PgUp/PgDn scroll report   ·   Ctrl+U clear field"
+            " Tab/↑↓ select   Space toggle   F2 inspect   F5 process   Esc quit"
         };
+        let view = if self.report_expanded {
+            "configuration"
+        } else {
+            "expand report"
+        };
+        let edit = if self.report_expanded || self.job.is_some() {
+            ""
+        } else {
+            "   Ctrl+U clear field"
+        };
+        let keys = format!("{keys}\n PgUp/PgDn scroll   F6 {view}{edit}");
         frame.render_widget(Paragraph::new(keys).dim(), footer);
     }
 
@@ -470,12 +501,12 @@ impl App {
     }
 
     fn draw_report(&mut self, frame: &mut Frame<'_>, area: Rect, color: Color) {
-        let block = Block::bordered()
+        let mut block = Block::bordered()
             .title(" Report ")
             .border_style(Style::new().fg(color));
         let body = block.inner(area);
-        frame.render_widget(block, area);
         if body.is_empty() {
+            frame.render_widget(block, area);
             return;
         }
         self.report_height = body.height;
@@ -484,17 +515,49 @@ impl App {
             .chars()
             .filter(|&ch| ch == '\n' || !ch.is_control())
             .collect();
-        let report = Paragraph::new(safe).wrap(Wrap { trim: false });
-        let max_offset = report
-            .line_count(body.width)
-            .saturating_sub(usize::from(body.height));
+        let lines = safe
+            .lines()
+            .map(|line| {
+                if matches!(self.status, Status::Failed) {
+                    Line::styled(line, Style::new().fg(Color::Red))
+                } else {
+                    report_line(line)
+                }
+            })
+            .collect::<Vec<_>>();
+        let report = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let line_count = report.line_count(body.width);
+        let max_offset = line_count.saturating_sub(usize::from(body.height));
         let max_offset = u16::try_from(max_offset).unwrap_or(u16::MAX);
         self.report_offset = if self.job.is_some() && self.follow {
             max_offset
         } else {
             self.report_offset.min(max_offset)
         };
+        let first = (usize::from(self.report_offset) + 1).min(line_count);
+        let last = (usize::from(self.report_offset) + usize::from(body.height)).min(line_count);
+        block =
+            block.title_bottom(Line::from(format!(" {first}-{last} / {line_count} lines ")).dim());
+        frame.render_widget(block, area);
         frame.render_widget(report.scroll((self.report_offset, 0)), body);
+    }
+}
+
+fn report_line(line: &str) -> Line<'_> {
+    let style = match report::line_kind(line) {
+        LineKind::Heading => Style::new().fg(Color::Cyan).bold(),
+        LineKind::Subheading => Style::new().fg(Color::White).bold(),
+        LineKind::Success => Style::new().fg(Color::Green),
+        LineKind::Warning => Style::new().fg(Color::Yellow),
+        LineKind::Text => Style::new().fg(Color::White),
+    };
+    if let Some(value) = report::value_start(line) {
+        Line::from(vec![
+            Span::styled(&line[..value], Style::new().fg(Color::Gray)),
+            Span::styled(&line[value..], style),
+        ])
+    } else {
+        Line::styled(line, style)
     }
 }
 

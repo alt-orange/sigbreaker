@@ -113,7 +113,7 @@ for variant in ["cpp", "cpp_fh3", "cpp_fh4", "cpp_guarded", "cpp_clang", "dll"]:
             packed = run([tool, prepared, "-o", output, "--compress-section", *control, *identity, *options])
             (folder / f"{variant}.{seed}.keep-{keep}.log").write_bytes(packed[1] + packed[2])
             assert packed[0] == 0, packed[2].decode(errors="replace")
-            assert b"compression: .sbrk LZMA" in packed[1], "compression was skipped"
+            assert b".sbrk LZMA" in packed[1], "compression was skipped"
             assert output.stat().st_size < prepared.stat().st_size
             for case in cases:
                 assert execute(output, case) == baseline[case], (variant, seed, keep, case)

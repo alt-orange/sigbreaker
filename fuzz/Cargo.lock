@@ -227,6 +227,7 @@ dependencies = [
 name = "sigbraker"
 version = "1.0.0"
 dependencies = [
+ "anstream",
  "anyhow",
  "clap",
  "iced-x86",

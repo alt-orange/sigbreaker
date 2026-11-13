@@ -98,7 +98,7 @@ fn pipeline_transforms_and_verifies() {
     ]);
 
     let report = pipeline::run(&cli).expect("pipeline must succeed");
-    assert!(report.contains("verified : OK"), "report:\n{report}");
+    assert!(report.contains("Verification                Passed"), "report:\n{report}");
 
     let out = out_path(&exe.path);
     let out_bytes = std::fs::read(&out).expect("output written");
@@ -402,13 +402,13 @@ fn report_counts_changed_functions_and_excludes_checksum_only_edits() {
     ]))
     .unwrap();
     assert!(
-        report.contains("transformed: 1/2 functions (50.00%)"),
+        report.contains("Functions changed           1 / 2 (50.00%)"),
         "{report}"
     );
     let control =
         pipeline::run(&exe.cli(&["--no-seg-inject", "--no-reorder", "--no-shuffle"])).unwrap();
     assert!(
-        control.contains("transformed: 0/2 functions (0.00%)"),
+        control.contains("Functions changed           0 / 2 (0.00%)"),
         "{control}"
     );
 }
@@ -441,7 +441,7 @@ fn defaults_enable_full_coverage_and_growth_can_be_disabled() {
     let default_bytes = std::fs::read(out_path(&exe.path)).unwrap();
     assert!(default_bytes.len() > pe.data.len());
     assert_eq!(default_bytes[0x400], 0xE9);
-    assert!(report.contains("transformed: 1/1 functions (100.00%)"));
+    assert!(report.contains("Functions changed           1 / 1 (100.00%)"));
     pipeline::run(&exe.cli(&[
         "--grow-segments",
         "--seg-prob",
@@ -464,7 +464,7 @@ fn defaults_enable_full_coverage_and_growth_can_be_disabled() {
         args.extend(flags);
         let report = pipeline::run(&exe.cli(&args)).unwrap();
         assert!(
-            report.contains("transformed: 0/1 functions (0.00%)"),
+            report.contains("Functions changed           0 / 1 (0.00%)"),
             "{report}"
         );
         assert_eq!(
@@ -479,7 +479,7 @@ fn defaults_enable_full_coverage_and_growth_can_be_disabled() {
         "--grow-segments",
     ]))
     .unwrap();
-    assert!(report.contains("transformed: 1/1 functions (100.00%)"));
+    assert!(report.contains("Functions changed           1 / 1 (100.00%)"));
 }
 
 #[test]
@@ -501,7 +501,7 @@ fn relocation_preserves_in_place_opcode_aliases() {
     pe.data[0x880..0x888].copy_from_slice(&[1, 5, 2, 0, 5, 0x34, 1, 0]);
     let exe = TempExe::write(&pe.data);
     let report = pipeline::run(&exe.cli(&["--no-seg-inject", "--no-reorder"])).unwrap();
-    assert!(report.contains("transformed: 1/1 functions"), "{report}");
+    assert!(report.contains("Functions changed           1 / 1"), "{report}");
     let bytes = std::fs::read(out_path(&exe.path)).unwrap();
     let output = sigbraker::pe::PeFile::parse(bytes).unwrap();
     let layout = output.layout();

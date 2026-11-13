@@ -84,7 +84,7 @@ fn lzma_round_trip_preserves_metadata_overlay_and_reprocessing() {
         Cli::parse_from(args)
     };
     let report = pipeline::run(&cli(true)).unwrap();
-    assert!(report.contains("compression: .sbrk LZMA"), "{report}");
+    assert!(report.contains("Section                     .sbrk LZMA"), "{report}");
     let packed = std::fs::read(&output).unwrap();
     assert!(packed.len() < source.len());
     assert_eq!(PeFile::parse(packed.clone()).unwrap().data, source);
@@ -116,7 +116,7 @@ fn lzma_round_trip_preserves_metadata_overlay_and_reprocessing() {
     let small = generated_section(0x200);
     std::fs::write(&input, &small).unwrap();
     let report = pipeline::run(&cli(true)).unwrap();
-    assert!(report.contains("compression: skipped"));
+    assert!(report.contains("Status                      Skipped (no net size savings)"));
     assert_eq!(std::fs::read(&output).unwrap(), small);
 
     std::fs::remove_file(input).unwrap();

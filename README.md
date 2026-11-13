@@ -17,7 +17,9 @@ target/release/sigbraker.exe --tui
 In the TUI, enter or paste the input PE path. Use **Tab** or **↑/↓** to
 select a field, **Space** to flip a switch, **F2** to inspect, and **F5** to
 process. The report pane shows progress, results and errors. Use **PgUp/PgDn**
-to scroll it and **Esc** to quit. Leave optional fields blank to use the CLI
+to scroll, **F6** to expand the report or return to configuration, and **Esc** to
+quit. Reports show the result first, followed by aligned pass counters and skip
+reasons ordered by frequency. Leave optional fields blank to use the CLI
 defaults. Build with `--no-default-features` for a CLI-only binary.
 
 Static CRT handler identities can be supplied from the matching linker `/MAP`
@@ -207,17 +209,34 @@ Logs, hashes, and generated artifacts remain under `target/`.
 ### Signature detection
 
 ```powershell
-python scripts/signature_test.py ORIGINAL PROCESSED [--prefix 256] [--baseline]
+python -m pip install -r scripts/requirements-signatures.txt
+python scripts/signature_test.py ORIGINAL PROCESSED --baseline --view both --json target/signatures.json
+python -m unittest discover -s tests -p test_signature_test.py -v
 ```
-Builds byte-pattern signatures from every original function (branch and
-rip-relative displacements plus image-range immediates are wildcarded;
-opcodes, registers, and small immediates stay concrete), then reports which
-signatures still match the processed binary. Results are split into two
-variants - entry-anchored (offset 0) and body-anchored (offset 16, past the
-entry trampoline) - and by match location: at the original site, in the
-appended section, or elsewhere (collision). `--baseline` adds the rate at
-which the same signatures match outside their own function in the original
-binary, which contextualizes collisions, especially for short prefixes.
+Builds wildcard byte patterns from the original x64 PE's runtime-function
+records (`.pdata`) and searches every executable section in the processed PE.
+Branch/call and RIP-relative displacements, plus image-address immediates and
+absolute memory operands, are wildcarded. Opcodes, registers, and other constants
+stay concrete. Metadata-free leaf functions are outside this test's coverage.
+
+Reports entry signatures and body signatures starting at the first instruction
+boundary at or after offset 16. Each pattern covers at most `--prefix 256` bytes;
+`--prefix 0` uses the full remaining function. Short, padding-only, and
+undecodable records are counted as skipped. `--sample N` selects the first N
+records. The original-byte control must pass; `--baseline` also checks the
+scanner against the original and reports patterns shared outside their source
+function, plus detection rates for patterns unique to their source function.
+A match elsewhere can come from shared code, so it does not by itself
+identify the original function.
+
+The default `--view decoded` restores LZMA `.sbrk` code before scanning, keeping
+the decoder's executable section in the search. `--view file` searches physical
+executable sections; `--view both` compares both when compression is present.
+Neither input is executed or modified. Per-signature JSON includes function and
+match RVAs, exact match counts by location, original-pattern uniqueness, and
+bounded match examples. `scan_offset` refers to the reconstructed image for
+decoded scans. Counts measure byte-pattern survival; a successful exit means
+the comparison and its controls completed, regardless of the detection rate.
 
 Saved main results can be checked further with `validate_reprocess.py`,
 `validate_exception_layouts.py`, and `report_validation.py`. The fuzz harness uses

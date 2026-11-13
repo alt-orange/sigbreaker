@@ -1,0 +1,2 @@
+capstone>=5,<6
+pyahocorasick>=2,<3

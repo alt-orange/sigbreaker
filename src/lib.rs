@@ -35,6 +35,7 @@ pub mod indirect;
 pub mod pe;
 pub mod pipeline;
 pub mod rebuild;
+pub mod report;
 pub mod stats;
 pub mod transforms;
 pub mod unwind;

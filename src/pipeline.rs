@@ -11,6 +11,7 @@ use rand::{Rng, SeedableRng};
 use crate::analysis::Analysis;
 use crate::cli::Cli;
 use crate::pe::PeFile;
+use crate::report::{field, number, size};
 use crate::transforms::{opcode_alias, relayout, reorder, segment_inject, shuffle};
 use crate::verify;
 
@@ -36,6 +37,7 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
     progress("Reading PE and unwind metadata");
     let raw = std::fs::read(&cli.input)
         .with_context(|| format!("failed to read {}", cli.input.display()))?;
+    let input_size = raw.len();
     let mut pe = PeFile::parse(raw)?;
     if let Some(path) = &cli.handler_map {
         let symbols = crate::exception::map_symbols(
@@ -56,30 +58,47 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
     let total_chains: usize = analysis.functions.iter().map(|f| f.chains.len()).sum();
 
     let mut report = String::new();
-    let _ = writeln!(
-        report,
-        "SigBreaker 1.0 — BLARE binary diversification engine"
+    let _ = writeln!(report, "Input");
+    field(&mut report, 2, "File", cli.input.display());
+    field(&mut report, 2, "Size", size(input_size as u64));
+    if input_size != pe.data.len() {
+        field(
+            &mut report,
+            2,
+            "Decoded file size",
+            size(pe.data.len() as u64),
+        );
+    }
+    field(
+        &mut report,
+        2,
+        "Image base",
+        format_args!("{:#x}", layout.image_base),
     );
-    let _ = writeln!(
-        report,
-        "  image    : base {:#x}, entry RVA {:#x}, {} bytes",
-        layout.image_base,
-        layout.entry_rva,
-        pe.data.len()
+    field(
+        &mut report,
+        2,
+        "Entry RVA",
+        format_args!("{:#x}", layout.entry_rva),
     );
-    let _ = writeln!(
-        report,
-        "  lifted   : {} functions, {total_blocks} blocks, {total_chains} chains, {total_instr} instructions, {} relocation-protected ranges",
-        analysis.functions.len(),
-        layout.relocation_count()
-    );
+    field(&mut report, 2, "Seed", number(cli.seed));
+    let _ = writeln!(report, "\nAnalysis");
+    for (label, count) in [
+        ("Functions", analysis.functions.len()),
+        ("Instructions", total_instr),
+        ("Blocks", total_blocks),
+        ("Chains", total_chains),
+        ("Protected ranges", layout.relocation_count()),
+    ] {
+        field(&mut report, 2, label, number(count as u64));
+    }
 
     if cli.info {
-        let _ = writeln!(
-            report,
-            "  mode     : analysis only (--info); nothing was modified"
-        );
-        return Ok(report);
+        field(&mut report, 2, "Mode", "analysis only (--info)");
+        return Ok(format!(
+            "SigBreaker {}\n\n{report}",
+            env!("CARGO_PKG_VERSION")
+        ));
     }
     // Count unique functions by their final code bytes, excluding header-only
     // changes, reverted edits, and duplicate transformations across passes.
@@ -90,6 +109,7 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
         .map(verify::Region::from)
         .collect();
     let move_globals = cli.auto_globals || cli.global_map.is_some();
+    let mut globals_report = String::new();
     let (layout, analysis, shifted_regions) = if move_globals {
         progress(if cli.auto_globals {
             "Discovering and relocating .data references"
@@ -113,15 +133,18 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
                 None => "failed to automatically relocate .data".to_owned(),
             })?;
         if cli.auto_globals {
-            let _ = writeln!(
-                report,
-                "  globals  : .data moved automatically (slot {slot})"
-            );
+            field(&mut globals_report, 2, "Mode", ".data moved automatically");
         } else {
-            let _ = writeln!(report, "  globals  : {} moved (slot {slot})", moved.len());
+            field(
+                &mut globals_report,
+                2,
+                "Objects moved",
+                number(moved.len() as u64),
+            );
         }
+        field(&mut globals_report, 2, "Layout slot", slot);
         for (old, new) in moved {
-            let _ = writeln!(report, "    RVA {old:#x} -> {new:#x}");
+            let _ = writeln!(globals_report, "  RVA {old:#x} -> {new:#x}");
         }
         drop(analysis);
         let layout = pe.layout().clone();
@@ -145,9 +168,15 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
         && cli.seg_prob > 0.0
         && !layout.runtime_functions.is_empty();
 
-    let mut pass = |name: &str, detail: String, c: crate::stats::Counters| {
-        let _ = writeln!(report, "  [pass] {name}: {detail} ({c})");
-    };
+    let mut passes = String::new();
+    let mut pass =
+        |name: &str, unit: &str, settings: Option<(&str, String)>, c: crate::stats::Counters| {
+            let _ = writeln!(passes, "\n  {name}");
+            if let Some((label, value)) = settings {
+                field(&mut passes, 4, label, value);
+            }
+            c.write_report(&mut passes, unit);
+        };
 
     // Pass 1 — segment selector injection.
     progress("Applying in-place transformations");
@@ -160,8 +189,9 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
         let c = segment_inject::run(&analysis, &layout, &mut pe.data, &cfg, &mut rng);
         let whitelist: Vec<String> = segments.iter().map(|r| format!("{r:?}")).collect();
         pass(
-            "segment selector injection",
-            format!("whitelist [{}]", whitelist.join(", ")),
+            "Segment selector injection",
+            "instructions",
+            Some(("Prefix whitelist", whitelist.join(", "))),
             c,
         );
     }
@@ -172,11 +202,7 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
             probability: cli.reorder_prob,
         };
         let c = reorder::run(&analysis, &layout, &mut pe.data, &cfg, &mut rng);
-        pass(
-            "instruction reordering",
-            "DAG-based randomized topological order".into(),
-            c,
-        );
+        pass("Instruction reordering", "runs", None, c);
     }
 
     // Keep the original verification spans, but release the instruction and
@@ -192,11 +218,7 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
             probability: cli.alias_prob,
         };
         let c = opcode_alias::run(&lifted, &layout, &mut pe.data, &cfg, &mut rng);
-        pass(
-            "opcode aliasing",
-            "equivalent ALU/MOV forms and unused bits in legacy encodings".into(),
-            c,
-        );
+        pass("Opcode aliasing", "instructions", None, c);
     }
     if !cli.no_verify {
         verify::verify_regions(&layout, &pe.data, verification_regions.iter().copied())?;
@@ -230,32 +252,18 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
                 },
                 alias_in_place,
             )?;
-            pass(
-                "basic block relocation",
-                "explicit jumps, updated runtime-function table, preserved opaque metadata".into(),
-                c,
-            );
+            pass("Basic block relocation", "functions", None, c);
         } else {
             let cfg = shuffle::Config {
                 probability: cli.shuffle_prob,
             };
             let c = shuffle::run(&lifted, &layout, &mut pe.data, &cfg, &mut rng);
-            pass(
-                "basic block shuffling",
-                "fall-through-safe chain relayout".into(),
-                c,
-            );
+            pass("Basic block shuffling", "functions", None, c);
         }
     }
 
-    if !cli.no_verify {
-        if layout.runtime_functions.is_empty() {
-            verify::verify_regions(&layout, &pe.data, verification_regions.iter().copied())?;
-        }
-        let _ = writeln!(
-            report,
-            "  verified : OK — in-place decoding and generated instruction/branch layouts checked"
-        );
+    if !cli.no_verify && layout.runtime_functions.is_empty() {
+        verify::verify_regions(&layout, &pe.data, verification_regions.iter().copied())?;
     }
 
     let transformed = original_regions
@@ -273,11 +281,6 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
     } else {
         100.0 * transformed as f64 / total as f64
     };
-    let _ = writeln!(
-        report,
-        "  transformed: {transformed}/{total} functions ({percentage:.2}%)"
-    );
-
     pe.update_checksum();
     let out_path = cli
         .output
@@ -289,36 +292,66 @@ pub fn run_with_progress(cli: &Cli, mut progress: impl FnMut(&str)) -> Result<St
     } else {
         None
     };
-    if cli.compress_section {
-        match &compressed {
-            Some(packed) => {
-                let _ = writeln!(
-                    report,
-                    "  compression: {} LZMA {} -> {} bytes; file {} -> {} bytes",
-                    packed.section,
-                    packed.original_size,
-                    packed.packed_size,
-                    pe.data.len(),
-                    packed.data.len()
-                );
-            }
-            None => {
-                let _ = writeln!(
-                    report,
-                    "  compression: skipped; no generated section with net size savings"
-                );
-            }
-        }
-    }
     progress("Writing output");
     let output = compressed
         .as_ref()
         .map_or(pe.data.as_slice(), |packed| packed.data.as_slice());
     crate::writer::write_atomic(&out_path, output)
         .with_context(|| format!("failed to write {}", out_path.display()))?;
-    let _ = writeln!(report, "  output   : {}", out_path.display());
-
-    Ok(report)
+    let mut result = format!("SigBreaker {}\n\nResult\n", env!("CARGO_PKG_VERSION"));
+    field(
+        &mut result,
+        2,
+        "Functions changed",
+        format!(
+            "{} / {} ({percentage:.2}%)",
+            number(transformed as u64),
+            number(total as u64)
+        ),
+    );
+    field(
+        &mut result,
+        2,
+        "Verification",
+        if cli.no_verify {
+            "Skipped (--no-verify)"
+        } else {
+            "Passed"
+        },
+    );
+    field(&mut result, 2, "Input size", size(input_size as u64));
+    field(&mut result, 2, "Output size", size(output.len() as u64));
+    field(&mut result, 2, "Output file", out_path.display());
+    if cli.compress_section {
+        let _ = writeln!(result, "\nCompression");
+        match &compressed {
+            Some(packed) => {
+                field(
+                    &mut result,
+                    2,
+                    "Section",
+                    format!("{} LZMA", packed.section),
+                );
+                field(&mut result, 2, "Before", size(packed.original_size as u64));
+                field(&mut result, 2, "After", size(packed.packed_size as u64));
+                field(
+                    &mut result,
+                    2,
+                    "File bytes saved",
+                    size((pe.data.len() - output.len()) as u64),
+                );
+            }
+            None => field(&mut result, 2, "Status", "Skipped (no net size savings)"),
+        }
+    }
+    let _ = writeln!(result, "\n{report}");
+    if !globals_report.is_empty() {
+        let _ = writeln!(result, "Globals\n{globals_report}");
+    }
+    if !passes.is_empty() {
+        let _ = write!(result, "Passes\n{passes}");
+    }
+    Ok(result)
 }
 
 fn default_output(input: &Path) -> PathBuf {
